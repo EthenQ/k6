@@ -1,31 +1,12 @@
-/*
- *
- * k6 - a next-generation load testing tool
- * Copyright (C) 2016 Load Impact
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of the
- * License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- */
-
 package v1
 
 import (
-	"github.com/loadimpact/k6/lib"
-	"github.com/manyminds/api2go/jsonapi"
-	"github.com/pkg/errors"
+	"fmt"
+
+	"go.k6.io/k6/v2/lib"
 )
 
+// Check represents a k6's check in a k6 REST API
 type Check struct {
 	ID     string `json:"id" yaml:"id"`
 	Path   string `json:"path" yaml:"path"`
@@ -34,6 +15,8 @@ type Check struct {
 	Fails  int64  `json:"fails" yaml:"fails"`
 }
 
+// NewCheck constructs a new v1.Check struct that is used for
+// a check representation in a k6 REST API
 func NewCheck(c *lib.Check) Check {
 	return Check{
 		ID:     c.ID,
@@ -44,6 +27,7 @@ func NewCheck(c *lib.Check) Check {
 	}
 }
 
+// Group represents a k6's group in a k6 REST API
 type Group struct {
 	ID     string  `json:"-" yaml:"id"`
 	Path   string  `json:"path" yaml:"path"`
@@ -56,6 +40,8 @@ type Group struct {
 	GroupIDs []string `json:"-" yaml:"group-ids"`
 }
 
+// NewGroup constructs a new v1.Group struct that is used for
+// a group representation in a k6 REST API
 func NewGroup(g *lib.Group, parent *Group) *Group {
 	group := &Group{
 		ID:   g.ID,
@@ -82,51 +68,7 @@ func NewGroup(g *lib.Group, parent *Group) *Group {
 	return group
 }
 
-func (g Group) GetID() string {
-	return g.ID
-}
-
-func (g *Group) SetID(v string) error {
-	g.ID = v
-	return nil
-}
-
-func (g Group) GetReferences() []jsonapi.Reference {
-	return []jsonapi.Reference{
-		{
-			Type:         "groups",
-			Name:         "parent",
-			Relationship: jsonapi.ToOneRelationship,
-		},
-		{
-			Type:         "groups",
-			Name:         "groups",
-			Relationship: jsonapi.ToManyRelationship,
-		},
-	}
-}
-
-func (g Group) GetReferencedIDs() []jsonapi.ReferenceID {
-	refs := []jsonapi.ReferenceID{}
-	if g.Parent != nil {
-		refs = append(refs, jsonapi.ReferenceID{
-			ID:           g.Parent.GetID(),
-			Type:         "groups",
-			Name:         "parent",
-			Relationship: jsonapi.ToOneRelationship,
-		})
-	}
-	for _, gp := range g.Groups {
-		refs = append(refs, jsonapi.ReferenceID{
-			ID:           gp.GetID(),
-			Type:         "groups",
-			Name:         "groups",
-			Relationship: jsonapi.ToManyRelationship,
-		})
-	}
-	return refs
-}
-
+// SetToManyReferenceIDs sets to-many relations (groups) for a group
 func (g *Group) SetToManyReferenceIDs(name string, ids []string) error {
 	switch name {
 	case "groups":
@@ -134,10 +76,11 @@ func (g *Group) SetToManyReferenceIDs(name string, ids []string) error {
 		g.GroupIDs = ids
 		return nil
 	default:
-		return errors.New("Unknown to many relation: " + name)
+		return fmt.Errorf("unknown to many relation: %s", name)
 	}
 }
 
+// SetToOneReferenceID sets to-one relation (parent) for a group
 func (g *Group) SetToOneReferenceID(name, id string) error {
 	switch name {
 	case "parent":
@@ -145,12 +88,15 @@ func (g *Group) SetToOneReferenceID(name, id string) error {
 		g.ParentID = id
 		return nil
 	default:
-		return errors.New("Unknown to one relation: " + name)
+		return fmt.Errorf("unknown to one relation: %s", name)
 	}
 }
 
+// FlattenGroup flattens a group and all its subgroups
+// into a slice of groups
 func FlattenGroup(g *Group) []*Group {
-	groups := []*Group{g}
+	groups := make([]*Group, 0, 1+len(g.Groups))
+	groups = append(groups, g)
 	for _, gp := range g.Groups {
 		groups = append(groups, FlattenGroup(gp)...)
 	}

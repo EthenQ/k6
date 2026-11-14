@@ -1,58 +1,49 @@
-/*
- *
- * k6 - a next-generation load testing tool
- * Copyright (C) 2016 Load Impact
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of the
- * License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- */
-
 package v1
 
 import (
-	"github.com/loadimpact/k6/core"
 	"gopkg.in/guregu/null.v3"
+
+	"go.k6.io/k6/v2/lib"
 )
 
+// Status represents the current status of the test run.
 type Status struct {
-	Paused null.Bool `json:"paused" yaml:"paused"`
-	VUs    null.Int  `json:"vus" yaml:"vus"`
-	VUsMax null.Int  `json:"vus-max" yaml:"vus-max"`
+	Status lib.ExecutionStatus `json:"status" yaml:"status"`
 
-	// Readonly.
-	Running bool `json:"running" yaml:"running"`
-	Tainted bool `json:"tainted" yaml:"tainted"`
+	Paused          null.Bool        `json:"paused" yaml:"paused"`
+	VUs             null.Int         `json:"vus" yaml:"vus"`
+	VUsMax          null.Int         `json:"vus-max" yaml:"vus-max"`
+	Stopped         bool             `json:"stopped" yaml:"stopped"`
+	Running         bool             `json:"running" yaml:"running"`
+	Tainted         bool             `json:"tainted" yaml:"tainted"`
+	ExecutionResult *ExecutionResult `json:"execution_result" yaml:"execution_result"`
 }
 
-func NewStatus(engine *core.Engine) Status {
-	return Status{
-		Paused:  null.BoolFrom(engine.Executor.IsPaused()),
-		VUs:     null.IntFrom(engine.Executor.GetVUs()),
-		VUsMax:  null.IntFrom(engine.Executor.GetVUsMax()),
-		Running: engine.Executor.IsRunning(),
-		Tainted: engine.IsTainted(),
+// ExecutionResult represents the result of a completed test execution.
+type ExecutionResult struct {
+	ExitCode int `json:"exit_code" yaml:"exit_code"`
+}
+
+func newStatus(cs *ControlSurface) Status {
+	executionState := cs.Scheduler.GetState()
+	var executionResult *ExecutionResult
+	if exitCode, ok := executionState.GetExecutionResult(); ok {
+		executionResult = &ExecutionResult{ExitCode: exitCode}
 	}
-}
-
-func (s Status) GetName() string {
-	return "status"
-}
-
-func (s Status) GetID() string {
-	return "default"
-}
-
-func (s Status) SetID(id string) error {
-	return nil
+	isStopped := false
+	select {
+	case <-cs.RunCtx.Done():
+		isStopped = true
+	default:
+	}
+	return Status{
+		Status:          executionState.GetCurrentExecutionStatus(),
+		Running:         executionState.HasStarted() && !executionState.HasEnded(),
+		Paused:          null.BoolFrom(executionState.IsPaused()),
+		Stopped:         isStopped,
+		VUs:             null.IntFrom(executionState.GetCurrentlyActiveVUsCount()),
+		VUsMax:          null.IntFrom(executionState.GetInitializedVUsCount()),
+		Tainted:         cs.MetricsEngine.GetMetricsWithBreachedThresholdsCount() > 0,
+		ExecutionResult: executionResult,
+	}
 }

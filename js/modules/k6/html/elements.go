@@ -6,11 +6,13 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/dop251/goja"
+	"github.com/grafana/sobek"
 )
 
 //go:generate go run gen/gen_elements.go
+//go:generate gofumpt -w .
 
+//nolint:gochecknoglobals
 var defaultPorts = map[string]string{
 	"http":  "80",
 	"https": "443",
@@ -75,64 +77,67 @@ const (
 	methodGet  = "get"
 )
 
-type HrefElement struct{ Element }
-type MediaElement struct{ Element }
-type FormFieldElement struct{ Element }
-type ModElement struct{ Element }
-type TableSectionElement struct{ Element }
-type TableCellElement struct{ Element }
+//revive:disable:exported
 
-type AnchorElement struct{ HrefElement }
-type AreaElement struct{ HrefElement }
-type AudioElement struct{ MediaElement }
-type BaseElement struct{ Element }
-type ButtonElement struct{ FormFieldElement }
-type CanvasElement struct{ Element }
-type DataElement struct{ Element }
-type DataListElement struct{ Element }
-type DelElement struct{ ModElement }
-type InsElement struct{ ModElement }
-type EmbedElement struct{ Element }
-type FieldSetElement struct{ Element }
-type FormElement struct{ Element }
-type IFrameElement struct{ Element }
-type ImageElement struct{ Element }
-type InputElement struct{ FormFieldElement }
-type KeygenElement struct{ Element }
-type LabelElement struct{ Element }
-type LegendElement struct{ Element }
-type LiElement struct{ Element }
-type LinkElement struct{ Element }
-type MapElement struct{ Element }
-type MetaElement struct{ Element }
-type MeterElement struct{ Element }
-type ObjectElement struct{ Element }
-type OListElement struct{ Element }
-type OptGroupElement struct{ Element }
-type OptionElement struct{ Element }
-type OutputElement struct{ Element }
-type ParamElement struct{ Element }
-type PreElement struct{ Element }
-type ProgressElement struct{ Element }
-type QuoteElement struct{ Element }
-type ScriptElement struct{ Element }
-type SelectElement struct{ Element }
-type SourceElement struct{ Element }
-type StyleElement struct{ Element }
-type TableElement struct{ Element }
-type TableHeadElement struct{ TableSectionElement }
-type TableFootElement struct{ TableSectionElement }
-type TableBodyElement struct{ TableSectionElement }
-type TableRowElement struct{ Element }
-type TableColElement struct{ Element }
-type TableDataCellElement struct{ TableCellElement }
-type TableHeaderCellElement struct{ TableCellElement }
-type TextAreaElement struct{ Element }
-type TimeElement struct{ Element }
-type TitleElement struct{ Element }
-type TrackElement struct{ Element }
-type UListElement struct{ Element }
-type VideoElement struct{ MediaElement }
+type (
+	HrefElement            struct{ Element }
+	MediaElement           struct{ Element }
+	FormFieldElement       struct{ Element }
+	ModElement             struct{ Element }
+	TableSectionElement    struct{ Element }
+	TableCellElement       struct{ Element }
+	AnchorElement          struct{ HrefElement }
+	AreaElement            struct{ HrefElement }
+	AudioElement           struct{ MediaElement }
+	BaseElement            struct{ Element }
+	ButtonElement          struct{ FormFieldElement }
+	CanvasElement          struct{ Element }
+	DataElement            struct{ Element }
+	DataListElement        struct{ Element }
+	DelElement             struct{ ModElement }
+	InsElement             struct{ ModElement }
+	EmbedElement           struct{ Element }
+	FieldSetElement        struct{ Element }
+	FormElement            struct{ Element }
+	IFrameElement          struct{ Element }
+	ImageElement           struct{ Element }
+	InputElement           struct{ FormFieldElement }
+	KeygenElement          struct{ Element }
+	LabelElement           struct{ Element }
+	LegendElement          struct{ Element }
+	LiElement              struct{ Element }
+	LinkElement            struct{ Element }
+	MapElement             struct{ Element }
+	MetaElement            struct{ Element }
+	MeterElement           struct{ Element }
+	ObjectElement          struct{ Element }
+	OListElement           struct{ Element }
+	OptGroupElement        struct{ Element }
+	OptionElement          struct{ Element }
+	OutputElement          struct{ Element }
+	ParamElement           struct{ Element }
+	PreElement             struct{ Element }
+	ProgressElement        struct{ Element }
+	QuoteElement           struct{ Element }
+	ScriptElement          struct{ Element }
+	SelectElement          struct{ Element }
+	SourceElement          struct{ Element }
+	StyleElement           struct{ Element }
+	TableElement           struct{ Element }
+	TableHeadElement       struct{ TableSectionElement }
+	TableFootElement       struct{ TableSectionElement }
+	TableBodyElement       struct{ TableSectionElement }
+	TableRowElement        struct{ Element }
+	TableColElement        struct{ Element }
+	TableDataCellElement   struct{ TableCellElement }
+	TableHeaderCellElement struct{ TableCellElement }
+	TextAreaElement        struct{ Element }
+	TimeElement            struct{ Element }
+	TitleElement           struct{ Element }
+	TrackElement           struct{ Element }
+	UListElement           struct{ Element }
+	VideoElement           struct{ MediaElement }
+)
 
 func (h HrefElement) hrefURL() *url.URL {
 	href, exists := h.attrAsURL("href")
@@ -219,7 +224,6 @@ func (h HrefElement) Password() string {
 	return pwd
 }
 
-// nolint: goconst
 func (h HrefElement) Origin() string {
 	href := h.hrefURL()
 
@@ -262,7 +266,7 @@ func (h HrefElement) Text() string {
 	return h.TextContent()
 }
 
-func (f FormFieldElement) Form() goja.Value {
+func (f FormFieldElement) Form() sobek.Value {
 	return f.ownerFormVal()
 }
 
@@ -302,7 +306,6 @@ func (f FormFieldElement) FormAction() string {
 	return actionURL.String()
 }
 
-// nolint: goconst
 func (f FormFieldElement) FormEnctype() string {
 	enctype, _ := f.formOrElemAttr("enctype")
 
@@ -337,7 +340,7 @@ func (f FormFieldElement) FormTarget() string {
 	return target
 }
 
-func (f FormFieldElement) Labels() []goja.Value {
+func (f FormFieldElement) Labels() []sobek.Value {
 	return f.elemLabels()
 }
 
@@ -357,14 +360,14 @@ func (c CanvasElement) Height() int {
 	return c.attrAsInt("height", 150)
 }
 
-func (d DataListElement) Options() []goja.Value {
+func (d DataListElement) Options() []sobek.Value {
 	return elemList(d.sel.Find("option"))
 }
 
-func (f FieldSetElement) Form() goja.Value {
+func (f FieldSetElement) Form() sobek.Value {
 	formSel, exists := f.ownerFormSel()
 	if !exists {
-		return goja.Undefined()
+		return sobek.Undefined()
 	}
 	return selToElement(Selection{f.sel.rt, formSel, f.sel.URL})
 }
@@ -373,15 +376,15 @@ func (f FieldSetElement) Type() string {
 	return "fieldset"
 }
 
-func (f FieldSetElement) Elements() []goja.Value {
+func (f FieldSetElement) Elements() []sobek.Value {
 	return elemList(f.sel.Find("input,select,button,textarea"))
 }
 
-func (f FieldSetElement) Validity() goja.Value {
-	return goja.Undefined()
+func (f FieldSetElement) Validity() sobek.Value {
+	return sobek.Undefined()
 }
 
-func (f FormElement) Elements() []goja.Value {
+func (f FormElement) Elements() []sobek.Value {
 	return elemList(f.sel.Find("input,select,button,textarea,fieldset"))
 }
 
@@ -397,62 +400,61 @@ func (f FormElement) Method() string {
 	return methodGet
 }
 
-// nolint: goconst
-func (i InputElement) List() goja.Value {
-	listId := i.attrAsString("list")
+func (i InputElement) List() sobek.Value {
+	listID := i.attrAsString("list")
 
-	if listId == "" {
-		return goja.Undefined()
+	if listID == "" {
+		return sobek.Undefined()
 	}
 
 	switch i.attrAsString("type") {
 	case "hidden":
-		return goja.Undefined()
+		return sobek.Undefined()
 	case "checkbox":
-		return goja.Undefined()
+		return sobek.Undefined()
 	case "radio":
-		return goja.Undefined()
+		return sobek.Undefined()
 	case "file":
-		return goja.Undefined()
+		return sobek.Undefined()
 	case "button":
-		return goja.Undefined()
+		return sobek.Undefined()
 	}
 
-	datalist := i.sel.sel.Parents().Last().Find("datalist[id=\"" + listId + "\"]")
+	datalist := i.sel.sel.Parents().Last().Find("datalist[id=\"" + listID + "\"]")
 	if datalist.Length() == 0 {
-		return goja.Undefined()
+		return sobek.Undefined()
 	}
 
 	return selToElement(Selection{i.sel.rt, datalist.Eq(0), i.sel.URL})
 }
 
-func (k KeygenElement) Form() goja.Value {
+func (k KeygenElement) Form() sobek.Value {
 	return k.ownerFormVal()
 }
 
-func (k KeygenElement) Labels() []goja.Value {
+func (k KeygenElement) Labels() []sobek.Value {
 	return k.elemLabels()
 }
 
-func (l LabelElement) Control() goja.Value {
+func (l LabelElement) Control() sobek.Value {
 	forAttr, exists := l.sel.sel.Attr("for")
 	if !exists {
-		return goja.Undefined()
+		return sobek.Undefined()
 	}
 
 	findControl := l.sel.sel.Parents().Last().Find("#" + forAttr)
 	if findControl.Length() == 0 {
-		return goja.Undefined()
+		return sobek.Undefined()
 	}
 
 	return selToElement(Selection{l.sel.rt, findControl.Eq(0), l.sel.URL})
 }
 
-func (l LabelElement) Form() goja.Value {
+func (l LabelElement) Form() sobek.Value {
 	return l.ownerFormVal()
 }
 
-func (l LegendElement) Form() goja.Value {
+func (l LegendElement) Form() sobek.Value {
 	return l.ownerFormVal()
 }
 
@@ -460,26 +462,26 @@ func (l LinkElement) RelList() []string {
 	return l.splitAttr("rel")
 }
 
-func (m MapElement) Areas() []goja.Value {
+func (m MapElement) Areas() []sobek.Value {
 	return elemList(m.sel.Find("area"))
 }
 
-func (m MapElement) Images() []goja.Value {
+func (m MapElement) Images() []sobek.Value {
 	name, exists := m.idOrNameAttr()
 
 	if !exists {
-		return make([]goja.Value, 0)
+		return make([]sobek.Value, 0)
 	}
 
 	imgs := m.sel.sel.Parents().Last().Find("img[usemap=\"#" + name + "\"],object[usemap=\"#" + name + "\"]")
 	return elemList(Selection{m.sel.rt, imgs, m.sel.URL})
 }
 
-func (m MeterElement) Labels() []goja.Value {
+func (m MeterElement) Labels() []sobek.Value {
 	return m.elemLabels()
 }
 
-func (o ObjectElement) Form() goja.Value {
+func (o ObjectElement) Form() sobek.Value {
 	return o.ownerFormVal()
 }
 
@@ -497,21 +499,21 @@ func (o OptionElement) Disabled() bool {
 	return exists
 }
 
-func (o OptionElement) Form() goja.Value {
+func (o OptionElement) Form() sobek.Value {
 	prtForm := o.sel.sel.ParentsFiltered("form")
 	if prtForm.Length() != 0 {
 		return selToElement(Selection{o.sel.rt, prtForm.First(), o.sel.URL})
 	}
 
 	prtSelect := o.sel.sel.ParentsFiltered("select")
-	formId, exists := prtSelect.Attr("form")
+	formID, exists := prtSelect.Attr("form")
 	if !exists {
-		return goja.Undefined()
+		return sobek.Undefined()
 	}
 
-	ownerForm := prtSelect.Parents().Last().Find("form#" + formId)
+	ownerForm := prtSelect.Parents().Last().Find("form#" + formID)
 	if ownerForm.Length() == 0 {
-		return goja.Undefined()
+		return sobek.Undefined()
 	}
 
 	return selToElement(Selection{o.sel.rt, ownerForm.First(), o.sel.URL})
@@ -542,11 +544,11 @@ func (o OptionElement) Value() string {
 	return valueOrHTML(o.sel.sel)
 }
 
-func (o OutputElement) Form() goja.Value {
+func (o OutputElement) Form() sobek.Value {
 	return o.ownerFormVal()
 }
 
-func (o OutputElement) Labels() []goja.Value {
+func (o OutputElement) Labels() []sobek.Value {
 	return o.elemLabels()
 }
 
@@ -594,7 +596,7 @@ func (p ProgressElement) Position() float64 {
 	return p.calcProgress(-1.0)
 }
 
-func (p ProgressElement) Labels() []goja.Value {
+func (p ProgressElement) Labels() []sobek.Value {
 	return p.elemLabels()
 }
 
@@ -602,11 +604,11 @@ func (s ScriptElement) Text() string {
 	return s.TextContent()
 }
 
-func (s SelectElement) Form() goja.Value {
+func (s SelectElement) Form() sobek.Value {
 	return s.ownerFormVal()
 }
 
-func (s SelectElement) Labels() []goja.Value {
+func (s SelectElement) Labels() []sobek.Value {
 	return s.elemLabels()
 }
 
@@ -614,7 +616,7 @@ func (s SelectElement) Length() int {
 	return s.sel.Find("option").Size()
 }
 
-func (s SelectElement) Options() []goja.Value {
+func (s SelectElement) Options() []sobek.Value {
 	return elemList(Selection{s.sel.rt, s.sel.sel.Find("option"), s.sel.URL})
 }
 
@@ -626,24 +628,22 @@ func (s SelectElement) SelectedIndex() int {
 	return s.sel.sel.Find("option").IndexOfSelection(option)
 }
 
-func (s SelectElement) SelectedOptions() []goja.Value {
+func (s SelectElement) SelectedOptions() []sobek.Value {
 	return elemList(Selection{s.sel.rt, s.sel.sel.Find("option[selected]"), s.sel.URL})
 }
 
 func (s SelectElement) Size() int {
 	if s.attrIsPresent("multiple") {
 		return 4
-	} else {
-		return 1
 	}
+	return 1
 }
 
 func (s SelectElement) Type() string {
 	if s.attrIsPresent("multiple") {
 		return "select-multiple"
-	} else {
-		return "select"
 	}
+	return "select"
 }
 
 func (s SelectElement) Value() string {
@@ -662,35 +662,35 @@ func (s StyleElement) Type() string {
 	return typeVal
 }
 
-func (t TableElement) firstChild(elemName string) goja.Value {
+func (t TableElement) firstChild(elemName string) sobek.Value {
 	child := t.sel.sel.ChildrenFiltered(elemName)
 	if child.Size() == 0 {
-		return goja.Undefined()
+		return sobek.Undefined()
 	}
 	return selToElement(Selection{t.sel.rt, child, t.sel.URL})
 }
 
-func (t TableElement) Caption() goja.Value {
+func (t TableElement) Caption() sobek.Value {
 	return t.firstChild("caption")
 }
 
-func (t TableElement) THead() goja.Value {
+func (t TableElement) THead() sobek.Value {
 	return t.firstChild("thead")
 }
 
-func (t TableElement) TFoot() goja.Value {
+func (t TableElement) TFoot() sobek.Value {
 	return t.firstChild("tfoot")
 }
 
-func (t TableElement) Rows() []goja.Value {
+func (t TableElement) Rows() []sobek.Value {
 	return elemList(Selection{t.sel.rt, t.sel.sel.Find("tr"), t.sel.URL})
 }
 
-func (t TableElement) TBodies() []goja.Value {
+func (t TableElement) TBodies() []sobek.Value {
 	return elemList(Selection{t.sel.rt, t.sel.sel.Find("tbody"), t.sel.URL})
 }
 
-func (t TableSectionElement) Rows() []goja.Value {
+func (t TableSectionElement) Rows() []sobek.Value {
 	return elemList(Selection{t.sel.rt, t.sel.sel.Find("tr"), t.sel.URL})
 }
 
@@ -702,7 +702,7 @@ func (t TableCellElement) CellIndex() int {
 	return prtRow.Find("th,td").IndexOfSelection(t.sel.sel)
 }
 
-func (t TableRowElement) Cells() []goja.Value {
+func (t TableRowElement) Cells() []sobek.Value {
 	return elemList(Selection{t.sel.rt, t.sel.sel.Find("th,td"), t.sel.URL})
 }
 
@@ -722,7 +722,7 @@ func (t TableRowElement) SectionRowIndex() int {
 	return section.Find("tr").IndexOfSelection(t.sel.sel)
 }
 
-func (t TextAreaElement) Form() goja.Value {
+func (t TextAreaElement) Form() sobek.Value {
 	return t.ownerFormVal()
 }
 
@@ -730,7 +730,7 @@ func (t TextAreaElement) Length() int {
 	return len(t.attrAsString("value"))
 }
 
-func (t TextAreaElement) Labels() []goja.Value {
+func (t TextAreaElement) Labels() []sobek.Value {
 	return t.elemLabels()
 }
 
@@ -742,7 +742,7 @@ func (t TableColElement) Span() int {
 	return span
 }
 
-func (m MediaElement) TextTracks() []goja.Value {
+func (m MediaElement) TextTracks() []sobek.Value {
 	return elemList(Selection{m.sel.rt, m.sel.sel.Find("track"), m.sel.URL})
 }
 

@@ -1,37 +1,16 @@
-/*
- *
- * k6 - a next-generation load testing tool
- * Copyright (C) 2016 Load Impact
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of the
- * License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- */
-
 package netext
 
 import (
 	"context"
+	"fmt"
 	"net"
-	"strings"
+	"strconv"
 	"sync/atomic"
 	"time"
 
-	"github.com/loadimpact/k6/lib/metrics"
-	"github.com/loadimpact/k6/stats"
-
-	"github.com/pkg/errors"
-	"github.com/viki-org/dnscache"
+	"go.k6.io/k6/v2/lib"
+	"go.k6.io/k6/v2/lib/types"
+	"go.k6.io/k6/v2/metrics"
 )
 
 // Dialer wraps net.Dialer and provides k6 specific functionality -
@@ -39,47 +18,50 @@ import (
 type Dialer struct {
 	net.Dialer
 
-	Resolver  *dnscache.Resolver
-	Blacklist []*net.IPNet
-	Hosts     map[string]net.IP
+	Resolver         Resolver
+	Blacklist        []*lib.IPNet
+	BlockedHostnames *types.HostnameTrie
+	Hosts            *types.Hosts
 
 	BytesRead    int64
 	BytesWritten int64
 }
 
-// NewDialer constructs a new Dialer and initializes its cache.
-func NewDialer(dialer net.Dialer) *Dialer {
+// NewDialer constructs a new Dialer with the given DNS resolver.
+func NewDialer(dialer net.Dialer, resolver Resolver) *Dialer {
 	return &Dialer{
 		Dialer:   dialer,
-		Resolver: dnscache.New(0),
+		Resolver: resolver,
 	}
+}
+
+// BlackListedIPError is an error that is returned when a given IP is blacklisted
+type BlackListedIPError struct {
+	ip  net.IP
+	net *lib.IPNet
+}
+
+func (b BlackListedIPError) Error() string {
+	return fmt.Sprintf("IP (%s) is in a blacklisted range (%s)", b.ip, b.net)
+}
+
+// BlockedHostError is returned when a given hostname is blocked
+type BlockedHostError struct {
+	hostname string
+	match    string
+}
+
+func (b BlockedHostError) Error() string {
+	return fmt.Sprintf("hostname (%s) is in a blocked pattern (%s)", b.hostname, b.match)
 }
 
 // DialContext wraps the net.Dialer.DialContext and handles the k6 specifics
 func (d *Dialer) DialContext(ctx context.Context, proto, addr string) (net.Conn, error) {
-	delimiter := strings.LastIndex(addr, ":")
-	host := addr[:delimiter]
-
-	// lookup for domain defined in Hosts option before trying to resolve DNS.
-	ip, ok := d.Hosts[host]
-	if !ok {
-		var err error
-		ip, err = d.Resolver.FetchOne(host)
-		if err != nil {
-			return nil, err
-		}
+	dialAddr, err := d.getDialAddr(addr)
+	if err != nil {
+		return nil, err
 	}
-
-	for _, net := range d.Blacklist {
-		if net.Contains(ip) {
-			return nil, errors.Errorf("IP (%s) is in a blacklisted range (%s)", ip, net)
-		}
-	}
-	ipStr := ip.String()
-	if strings.ContainsRune(ipStr, ':') {
-		ipStr = "[" + ipStr + "]"
-	}
-	conn, err := d.Dialer.DialContext(ctx, proto, ipStr+":"+addr[delimiter+1:])
+	conn, err := d.Dialer.DialContext(ctx, proto, dialAddr.String())
 	if err != nil {
 		return nil, err
 	}
@@ -87,67 +69,126 @@ func (d *Dialer) DialContext(ctx context.Context, proto, addr string) (net.Conn,
 	return conn, err
 }
 
-// GetTrail creates a new NetTrail instance with the Dialer
-// sent and received data metrics and the supplied times and tags.
-func (d *Dialer) GetTrail(startTime, endTime time.Time, tags *stats.SampleTags) *NetTrail {
+// ResolveAddr looks up the IP address for the given host and optionally port.
+// The address is expected in the form "host:port" or just "host".
+// It returns the resolved IP, and an error if any.
+func (d *Dialer) ResolveAddr(addr string) (net.IP, int, error) {
+	// Check if the address has a port, if not add a dummy port for parsing
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		// Address doesn't have a port, add a dummy one
+		addr = net.JoinHostPort(addr, "0")
+	}
+
+	remote, err := d.getDialAddr(addr)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return remote.IP, remote.Port, nil
+}
+
+// IOSamples returns samples for data send and received since it last call and zeros out.
+// It uses the provided time as the sample time and tags and builtinMetrics to build the samples.
+func (d *Dialer) IOSamples(
+	sampleTime time.Time, ctm metrics.TagsAndMeta, builtinMetrics *metrics.BuiltinMetrics,
+) metrics.SampleContainer {
 	bytesWritten := atomic.SwapInt64(&d.BytesWritten, 0)
 	bytesRead := atomic.SwapInt64(&d.BytesRead, 0)
-	return &NetTrail{
-		BytesRead:    bytesRead,
-		BytesWritten: bytesWritten,
-		StartTime:    startTime,
-		EndTime:      endTime,
-		Tags:         tags,
-		Samples: []stats.Sample{
-			{
-				Time:   endTime,
-				Metric: metrics.DataSent,
-				Value:  float64(bytesWritten),
-				Tags:   tags,
+	return metrics.Samples([]metrics.Sample{
+		{
+			TimeSeries: metrics.TimeSeries{
+				Metric: builtinMetrics.DataSent,
+				Tags:   ctm.Tags,
 			},
-			{
-				Time:   endTime,
-				Metric: metrics.DataReceived,
-				Value:  float64(bytesRead),
-				Tags:   tags,
-			},
-			{
-				Time:   endTime,
-				Metric: metrics.IterationDuration,
-				Value:  stats.D(endTime.Sub(startTime)),
-				Tags:   tags,
-			},
+			Time:     sampleTime,
+			Metadata: ctm.Metadata,
+			Value:    float64(bytesWritten),
 		},
+		{
+			TimeSeries: metrics.TimeSeries{
+				Metric: builtinMetrics.DataReceived,
+				Tags:   ctm.Tags,
+			},
+			Time:     sampleTime,
+			Metadata: ctm.Metadata,
+			Value:    float64(bytesRead),
+		},
+	})
+}
+
+func (d *Dialer) getDialAddr(addr string) (*types.Host, error) {
+	remote, err := d.findRemote(addr)
+	if err != nil {
+		return nil, err
 	}
+
+	for _, ipnet := range d.Blacklist {
+		if ipnet.Contains(remote.IP) {
+			return nil, BlackListedIPError{ip: remote.IP, net: ipnet}
+		}
+	}
+
+	return remote, nil
 }
 
-// NetTrail contains information about the exchanged data size and length of a
-// series of connections from a particular netext.Dialer
-type NetTrail struct {
-	BytesRead    int64
-	BytesWritten int64
-	StartTime    time.Time
-	EndTime      time.Time
-	Tags         *stats.SampleTags
-	Samples      []stats.Sample
+func (d *Dialer) findRemote(addr string) (*types.Host, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	ip := net.ParseIP(host)
+	if d.BlockedHostnames != nil && ip == nil {
+		if match, blocked := d.BlockedHostnames.Contains(host); blocked {
+			return nil, BlockedHostError{hostname: host, match: match}
+		}
+	}
+
+	if d.Hosts != nil {
+		remote, e := d.getConfiguredHost(addr, host, port)
+		if e != nil || remote != nil {
+			return remote, e
+		}
+	}
+
+	if ip != nil {
+		return types.NewHost(ip, port)
+	}
+
+	ip, err = d.Resolver.LookupIP(host)
+	if err != nil {
+		return nil, err
+	}
+
+	if ip == nil {
+		return nil, fmt.Errorf("lookup %s: no such host", host)
+	}
+
+	return types.NewHost(ip, port)
 }
 
-// Ensure that interfaces are implemented correctly
-var _ stats.ConnectedSampleContainer = &NetTrail{}
+func (d *Dialer) getConfiguredHost(addr, host, port string) (*types.Host, error) {
+	if remote := d.Hosts.Match(addr); remote != nil {
+		return remote, nil
+	}
 
-// GetSamples implements the stats.SampleContainer interface.
-func (ntr *NetTrail) GetSamples() []stats.Sample {
-	return ntr.Samples
-}
+	if remote := d.Hosts.Match(host); remote != nil {
+		if remote.Port != 0 || port == "" {
+			return remote, nil
+		}
 
-// GetTags implements the stats.ConnectedSampleContainer interface.
-func (ntr *NetTrail) GetTags() *stats.SampleTags {
-	return ntr.Tags
-}
+		newPort, err := strconv.Atoi(port)
+		if err != nil {
+			return nil, err
+		}
 
-// GetTime implements the stats.ConnectedSampleContainer interface.
-func (ntr *NetTrail) GetTime() time.Time {
-	return ntr.EndTime
+		newRemote := *remote
+		newRemote.Port = newPort
+
+		return &newRemote, nil
+	}
+
+	return nil, nil //nolint:nilnil
 }
 
 // Conn wraps net.Conn and keeps track of sent and received data size

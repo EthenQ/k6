@@ -1,144 +1,59 @@
-/*
- *
- * k6 - a next-generation load testing tool
- * Copyright (C) 2016 Load Impact
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of the
- * License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- */
-
 package http
 
 import (
-	"context"
-	"crypto/tls"
 	"encoding/json"
-
+	"errors"
 	"fmt"
+	"maps"
+	"net/http"
 	"net/url"
 	"strings"
 
-	"github.com/dop251/goja"
-	"github.com/loadimpact/k6/js/common"
-	"github.com/loadimpact/k6/js/modules/k6/html"
-	"github.com/loadimpact/k6/lib"
-	"golang.org/x/crypto/ocsp"
+	"github.com/grafana/sobek"
+	"github.com/tidwall/gjson"
+
+	"go.k6.io/k6/v2/js/common"
+	"go.k6.io/k6/v2/js/modules/k6/html"
+	"go.k6.io/k6/v2/lib/netext/httpext"
 )
 
-type OCSP struct {
-	ProducedAt, ThisUpdate, NextUpdate, RevokedAt int64
-	RevocationReason                              string
-	Status                                        string
+// Response is a representation of an HTTP response to be returned to the Sobek VM
+type Response struct {
+	*httpext.Response `js:"-"`
+	client            *Client
+
+	cachedJSON    any
+	validatedJSON bool
 }
 
-type HTTPResponseTimings struct {
-	Duration, Blocked, LookingUp, Connecting, TLSHandshaking, Sending, Waiting, Receiving float64
+type jsonError struct {
+	line      int
+	character int
+	err       error
 }
 
-type HTTPResponse struct {
-	ctx context.Context
-
-	RemoteIP       string
-	RemotePort     int
-	URL            string
-	Status         int
-	Proto          string
-	Headers        map[string]string
-	Cookies        map[string][]*HTTPCookie
-	Body           string
-	Timings        HTTPResponseTimings
-	TLSVersion     string
-	TLSCipherSuite string
-	OCSP           OCSP `js:"ocsp"`
-	Error          string
-	Request        HTTPRequest
-
-	cachedJSON goja.Value
+func (j jsonError) Error() string {
+	errMessage := "cannot parse json due to an error at line"
+	return fmt.Sprintf("%s %d, character %d , error: %v", errMessage, j.line, j.character, j.err)
 }
 
-func (res *HTTPResponse) setTLSInfo(tlsState *tls.ConnectionState) {
-	switch tlsState.Version {
-	case tls.VersionSSL30:
-		res.TLSVersion = SSL_3_0
-	case tls.VersionTLS10:
-		res.TLSVersion = TLS_1_0
-	case tls.VersionTLS11:
-		res.TLSVersion = TLS_1_1
-	case tls.VersionTLS12:
-		res.TLSVersion = TLS_1_2
+// HTML returns the body as an html.Selection
+func (res *Response) HTML(selector ...string) html.Selection {
+	rt := res.client.moduleInstance.vu.Runtime()
+	if res.Body == nil {
+		err := fmt.Errorf("the body is null so we can't transform it to HTML" +
+			" - this likely was because of a request error getting the response")
+		common.Throw(rt, err)
 	}
 
-	res.TLSCipherSuite = lib.SupportedTLSCipherSuitesToString[tlsState.CipherSuite]
-	ocspStapledRes := OCSP{Status: OCSP_STATUS_UNKNOWN}
-
-	if ocspRes, err := ocsp.ParseResponse(tlsState.OCSPResponse, nil); err == nil {
-		switch ocspRes.Status {
-		case ocsp.Good:
-			ocspStapledRes.Status = OCSP_STATUS_GOOD
-		case ocsp.Revoked:
-			ocspStapledRes.Status = OCSP_STATUS_REVOKED
-		case ocsp.ServerFailed:
-			ocspStapledRes.Status = OCSP_STATUS_SERVER_FAILED
-		case ocsp.Unknown:
-			ocspStapledRes.Status = OCSP_STATUS_UNKNOWN
-		}
-		switch ocspRes.RevocationReason {
-		case ocsp.Unspecified:
-			ocspStapledRes.RevocationReason = OCSP_REASON_UNSPECIFIED
-		case ocsp.KeyCompromise:
-			ocspStapledRes.RevocationReason = OCSP_REASON_KEY_COMPROMISE
-		case ocsp.CACompromise:
-			ocspStapledRes.RevocationReason = OCSP_REASON_CA_COMPROMISE
-		case ocsp.AffiliationChanged:
-			ocspStapledRes.RevocationReason = OCSP_REASON_AFFILIATION_CHANGED
-		case ocsp.Superseded:
-			ocspStapledRes.RevocationReason = OCSP_REASON_SUPERSEDED
-		case ocsp.CessationOfOperation:
-			ocspStapledRes.RevocationReason = OCSP_REASON_CESSATION_OF_OPERATION
-		case ocsp.CertificateHold:
-			ocspStapledRes.RevocationReason = OCSP_REASON_CERTIFICATE_HOLD
-		case ocsp.RemoveFromCRL:
-			ocspStapledRes.RevocationReason = OCSP_REASON_REMOVE_FROM_CRL
-		case ocsp.PrivilegeWithdrawn:
-			ocspStapledRes.RevocationReason = OCSP_REASON_PRIVILEGE_WITHDRAWN
-		case ocsp.AACompromise:
-			ocspStapledRes.RevocationReason = OCSP_REASON_AA_COMPROMISE
-		}
-		ocspStapledRes.ProducedAt = ocspRes.ProducedAt.Unix()
-		ocspStapledRes.ThisUpdate = ocspRes.ThisUpdate.Unix()
-		ocspStapledRes.NextUpdate = ocspRes.NextUpdate.Unix()
-		ocspStapledRes.RevokedAt = ocspRes.RevokedAt.Unix()
-	}
-
-	res.OCSP = ocspStapledRes
-}
-
-func (res *HTTPResponse) Json() goja.Value {
-	if res.cachedJSON == nil {
-		var v interface{}
-		if err := json.Unmarshal([]byte(res.Body), &v); err != nil {
-			common.Throw(common.GetRuntime(res.ctx), err)
-		}
-		res.cachedJSON = common.GetRuntime(res.ctx).ToValue(v)
-	}
-	return res.cachedJSON
-}
-
-func (res *HTTPResponse) Html(selector ...string) html.Selection {
-	sel, err := html.HTML{}.ParseHTML(res.ctx, res.Body)
+	body, err := common.ToString(res.Body)
 	if err != nil {
-		common.Throw(common.GetRuntime(res.ctx), err)
+		common.Throw(rt, err)
+	}
+
+	sel, err := html.ParseHTML(rt, body)
+	if err != nil {
+		common.Throw(rt, err)
 	}
 	sel.URL = res.URL
 	if len(selector) > 0 {
@@ -147,13 +62,95 @@ func (res *HTTPResponse) Html(selector ...string) html.Selection {
 	return sel
 }
 
-func (res *HTTPResponse) SubmitForm(args ...goja.Value) (*HTTPResponse, error) {
-	rt := common.GetRuntime(res.ctx)
+// JSON parses the body of a response as JSON and returns it to the Sobek VM.
+func (res *Response) JSON(selector ...string) sobek.Value {
+	rt := res.client.moduleInstance.vu.Runtime()
+
+	if res.Body == nil {
+		err := fmt.Errorf("the body is null so we can't transform it to JSON" +
+			" - this likely was because of a request error getting the response")
+		common.Throw(rt, err)
+	}
+
+	hasSelector := len(selector) > 0
+	if res.cachedJSON == nil || hasSelector { //nolint:nestif
+		var v any
+
+		body, err := common.ToBytes(res.Body)
+		if err != nil {
+			common.Throw(rt, err)
+		}
+
+		if hasSelector {
+			if !res.validatedJSON {
+				if !gjson.ValidBytes(body) {
+					return sobek.Undefined()
+				}
+				res.validatedJSON = true
+			}
+
+			result := gjson.GetBytes(body, selector[0])
+
+			if !result.Exists() {
+				return sobek.Undefined()
+			}
+			return rt.ToValue(result.Value())
+		}
+
+		if err := json.Unmarshal(body, &v); err != nil {
+			if syntaxError, ok := errors.AsType[*json.SyntaxError](err); ok {
+				err = checkErrorInJSON(body, int(syntaxError.Offset), err)
+			}
+			common.Throw(rt, err)
+		}
+		res.validatedJSON = true
+		res.cachedJSON = v
+	}
+
+	return rt.ToValue(res.cachedJSON)
+}
+
+func checkErrorInJSON(input []byte, offset int, err error) error {
+	lf := '\n'
+	str := string(input)
+
+	// Humans tend to count from 1.
+	line := 1
+	character := 0
+
+	// SyntaxError.Offset is the number of bytes read (1-based).
+	if offset > 0 {
+		offset--
+	}
+
+	for i, b := range str {
+		if b == lf {
+			line++
+			character = 0
+		} else {
+			character++
+		}
+
+		if i >= offset {
+			if b == lf {
+				character = 1
+			}
+			break
+		}
+	}
+
+	return jsonError{line: line, character: character, err: err}
+}
+
+// SubmitForm parses the body as an html looking for a from and then submitting it
+// TODO: document the actual arguments that can be provided
+func (res *Response) SubmitForm(args ...sobek.Value) (*Response, error) {
+	rt := res.client.moduleInstance.vu.Runtime()
 
 	formSelector := "form"
 	submitSelector := "[type=\"submit\"]"
-	var fields map[string]goja.Value
-	requestParams := goja.Null()
+	var fields map[string]sobek.Value
+	requestParams := sobek.Null()
 	if len(args) > 0 {
 		params := args[0].ToObject(rt)
 		for _, k := range params.Keys() {
@@ -172,36 +169,36 @@ func (res *HTTPResponse) SubmitForm(args ...goja.Value) (*HTTPResponse, error) {
 		}
 	}
 
-	form := res.Html(formSelector)
+	form := res.HTML(formSelector)
 	if form.Size() == 0 {
 		common.Throw(rt, fmt.Errorf("no form found for selector '%s' in response '%s'", formSelector, res.URL))
 	}
 
 	methodAttr := form.Attr("method")
 	var requestMethod string
-	if methodAttr == goja.Undefined() {
+	if methodAttr == sobek.Undefined() {
 		// Use GET by default
-		requestMethod = HTTP_METHOD_GET
+		requestMethod = http.MethodGet
 	} else {
 		requestMethod = strings.ToUpper(methodAttr.String())
 	}
 
-	responseUrl, err := url.Parse(res.URL)
+	responseURL, err := url.Parse(res.URL)
 	if err != nil {
 		common.Throw(rt, err)
 	}
 
 	actionAttr := form.Attr("action")
-	var requestUrl *url.URL
-	if actionAttr == goja.Undefined() {
+	var requestURL *url.URL
+	if actionAttr == sobek.Undefined() {
 		// Use the url of the response if no action is set
-		requestUrl = responseUrl
+		requestURL = responseURL
 	} else {
-		actionUrl, err := url.Parse(actionAttr.String())
+		actionURL, err := url.Parse(actionAttr.String())
 		if err != nil {
 			common.Throw(rt, err)
 		}
-		requestUrl = responseUrl.ResolveReference(actionUrl)
+		requestURL = responseURL.ResolveReference(actionURL)
 	}
 
 	// Set the body based on the form values
@@ -211,31 +208,34 @@ func (res *HTTPResponse) SubmitForm(args ...goja.Value) (*HTTPResponse, error) {
 	submit := form.Find(submitSelector)
 	submitName := submit.Attr("name")
 	submitValue := submit.Val()
-	if submitName != goja.Undefined() && submitValue != goja.Undefined() {
+	if submitName != sobek.Undefined() && submitValue != sobek.Undefined() {
 		values[submitName.String()] = submitValue
 	}
 
 	// Set the values supplied in the arguments, overriding automatically set values
-	for k, v := range fields {
-		values[k] = v
-	}
+	maps.Copy(values, fields)
 
-	if requestMethod == HTTP_METHOD_GET {
+	if requestMethod == http.MethodGet {
 		q := url.Values{}
 		for k, v := range values {
 			q.Add(k, v.String())
 		}
-		requestUrl.RawQuery = q.Encode()
-		return New().Request(res.ctx, requestMethod, rt.ToValue(requestUrl.String()), goja.Null(), requestParams)
+		requestURL.RawQuery = q.Encode()
+		return res.client.Request(requestMethod, rt.ToValue(requestURL.String()), sobek.Null(), requestParams)
 	}
-	return New().Request(res.ctx, requestMethod, rt.ToValue(requestUrl.String()), rt.ToValue(values), requestParams)
+	return res.client.Request(
+		requestMethod, rt.ToValue(requestURL.String()),
+		rt.ToValue(values), requestParams,
+	)
 }
 
-func (res *HTTPResponse) ClickLink(args ...goja.Value) (*HTTPResponse, error) {
-	rt := common.GetRuntime(res.ctx)
+// ClickLink parses the body as an html, looks for a link and than makes a request as if the link was
+// clicked
+func (res *Response) ClickLink(args ...sobek.Value) (*Response, error) {
+	rt := res.client.moduleInstance.vu.Runtime()
 
 	selector := "a[href]"
-	requestParams := goja.Null()
+	requestParams := sobek.Null()
 	if len(args) > 0 {
 		params := args[0].ToObject(rt)
 		for _, k := range params.Keys() {
@@ -248,24 +248,25 @@ func (res *HTTPResponse) ClickLink(args ...goja.Value) (*HTTPResponse, error) {
 		}
 	}
 
-	responseUrl, err := url.Parse(res.URL)
+	responseURL, err := url.Parse(res.URL)
 	if err != nil {
 		common.Throw(rt, err)
 	}
 
-	link := res.Html(selector)
+	link := res.HTML(selector)
 	if link.Size() == 0 {
 		common.Throw(rt, fmt.Errorf("no element found for selector '%s' in response '%s'", selector, res.URL))
 	}
 	hrefAttr := link.Attr("href")
-	if hrefAttr == goja.Undefined() {
-		common.Throw(rt, fmt.Errorf("no valid href attribute value found on element '%s' in response '%s'", selector, res.URL))
+	if hrefAttr == sobek.Undefined() {
+		errmsg := fmt.Errorf("no valid href attribute value found on element '%s' in response '%s'", selector, res.URL)
+		common.Throw(rt, errmsg)
 	}
-	hrefUrl, err := url.Parse(hrefAttr.String())
+	hrefURL, err := url.Parse(hrefAttr.String())
 	if err != nil {
 		common.Throw(rt, err)
 	}
-	requestUrl := responseUrl.ResolveReference(hrefUrl)
+	requestURL := responseURL.ResolveReference(hrefURL)
 
-	return New().Get(res.ctx, rt.ToValue(requestUrl.String()), requestParams)
+	return res.client.Request(http.MethodGet, rt.ToValue(requestURL.String()), sobek.Undefined(), requestParams)
 }

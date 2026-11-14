@@ -9,13 +9,13 @@ import (
 )
 
 type sourceMap struct {
-	Version        int           `json:"version"`
-	File           string        `json:"file"`
-	SourceRoot     string        `json:"sourceRoot"`
-	Sources        []string      `json:"sources"`
-	SourcesContent []string      `json:"sourcesContent"`
-	Names          []json.Number `json:"names"`
-	Mappings       string        `json:"mappings"`
+	Version        int               `json:"version"`
+	File           string            `json:"file"`
+	SourceRoot     string            `json:"sourceRoot"`
+	Sources        []string          `json:"sources"`
+	SourcesContent []string          `json:"sourcesContent"`
+	Names          []json.RawMessage `json:"names,string"`
+	Mappings       string            `json:"mappings"`
 
 	mappings []mapping
 }
@@ -86,6 +86,26 @@ func (m *sourceMap) absSource(root *url.URL, source string) string {
 	}
 
 	return source
+}
+
+func (m *sourceMap) name(idx int) string {
+	if idx >= len(m.Names) {
+		return ""
+	}
+
+	raw := m.Names[idx]
+	if len(raw) == 0 {
+		return ""
+	}
+
+	if raw[0] == '"' && raw[len(raw)-1] == '"' {
+		var str string
+		if err := json.Unmarshal(raw, &str); err == nil {
+			return str
+		}
+	}
+
+	return string(raw)
 }
 
 type section struct {
@@ -164,6 +184,10 @@ func (c *Consumer) Source(
 func (c *Consumer) source(
 	m *sourceMap, genLine, genColumn int,
 ) (source, name string, line, column int, ok bool) {
+	if len(m.mappings) == 0 {
+		return
+	}
+
 	i := sort.Search(len(m.mappings), func(i int) bool {
 		m := &m.mappings[i]
 		if int(m.genLine) == genLine {
@@ -172,26 +196,31 @@ func (c *Consumer) source(
 		return int(m.genLine) >= genLine
 	})
 
-	// Mapping not found.
+	var match *mapping
+	// Mapping not found
 	if i == len(m.mappings) {
-		return
-	}
-
-	match := &m.mappings[i]
-
-	// Fuzzy match.
-	if int(match.genLine) > genLine || int(match.genColumn) > genColumn {
-		if i == 0 {
+		// lets see if the line is correct but the column is bigger
+		match = &m.mappings[i-1]
+		if int(match.genLine) != genLine {
 			return
 		}
-		match = &m.mappings[i-1]
+	} else {
+		match = &m.mappings[i]
+
+		// Fuzzy match.
+		if int(match.genLine) > genLine || int(match.genColumn) > genColumn {
+			if i == 0 {
+				return
+			}
+			match = &m.mappings[i-1]
+		}
 	}
 
 	if match.sourcesInd >= 0 {
 		source = m.Sources[match.sourcesInd]
 	}
 	if match.namesInd >= 0 {
-		name = string(m.Names[match.namesInd])
+		name = m.name(int(match.namesInd))
 	}
 	line = int(match.sourceLine)
 	column = int(match.sourceColumn)

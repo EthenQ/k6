@@ -1,40 +1,15 @@
-/*
- *
- * k6 - a next-generation load testing tool
- * Copyright (C) 2016 Load Impact
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of the
- * License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- */
-
 package v1
 
 import (
+	"encoding/json"
 	"net/http"
-
-	"github.com/julienschmidt/httprouter"
-	"github.com/loadimpact/k6/api/common"
-	"github.com/manyminds/api2go/jsonapi"
 )
 
-func HandleGetGroups(rw http.ResponseWriter, r *http.Request, p httprouter.Params) {
-	engine := common.GetEngine(r.Context())
-
-	root := NewGroup(engine.Executor.GetRunner().GetDefaultGroup(), nil)
+func handleGetGroups(cs *ControlSurface, rw http.ResponseWriter, _ *http.Request) {
+	root := NewGroup(cs.RunState.GroupSummary.Group(), nil)
 	groups := FlattenGroup(root)
 
-	data, err := jsonapi.Marshal(groups)
+	data, err := json.Marshal(newGroupsJSONAPI(groups))
 	if err != nil {
 		apiError(rw, "Encoding error", err.Error(), http.StatusInternalServerError)
 		return
@@ -42,12 +17,8 @@ func HandleGetGroups(rw http.ResponseWriter, r *http.Request, p httprouter.Param
 	_, _ = rw.Write(data)
 }
 
-func HandleGetGroup(rw http.ResponseWriter, r *http.Request, p httprouter.Params) {
-	id := p.ByName("id")
-
-	engine := common.GetEngine(r.Context())
-
-	root := NewGroup(engine.Executor.GetRunner().GetDefaultGroup(), nil)
+func handleGetGroup(cs *ControlSurface, rw http.ResponseWriter, _ *http.Request, id string) {
+	root := NewGroup(cs.RunState.GroupSummary.Group(), nil)
 	groups := FlattenGroup(root)
 
 	var group *Group
@@ -62,7 +33,7 @@ func HandleGetGroup(rw http.ResponseWriter, r *http.Request, p httprouter.Params
 		return
 	}
 
-	data, err := jsonapi.Marshal(group)
+	data, err := json.Marshal(newGroupJSONAPI(group))
 	if err != nil {
 		apiError(rw, "Encoding error", err.Error(), http.StatusInternalServerError)
 		return

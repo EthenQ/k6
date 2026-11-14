@@ -1,0 +1,693 @@
+package common
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"testing"
+	"time"
+
+	"go.k6.io/k6/v2/internal/features"
+	"go.k6.io/k6/v2/internal/js/modules/k6/browser/k6ext"
+	"go.k6.io/k6/v2/internal/js/modules/k6/browser/k6ext/k6test"
+	"go.k6.io/k6/v2/internal/js/modules/k6/browser/log"
+
+	k6mockresolver "go.k6.io/k6/v2/internal/lib/testutils/mockresolver"
+	k6lib "go.k6.io/k6/v2/lib"
+	k6types "go.k6.io/k6/v2/lib/types"
+	k6metrics "go.k6.io/k6/v2/metrics"
+
+	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/fetch"
+	"github.com/chromedp/cdproto/network"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+const mockHostname = "host.test"
+
+type fakeSession struct {
+	session
+	cdpCalls []string
+}
+
+// Execute implements the executor interface to record calls made to it and
+// allow assertions in tests.
+func (s *fakeSession) Execute(
+	ctx context.Context, method string, params, res any,
+) error {
+	s.cdpCalls = append(s.cdpCalls, method)
+	return nil
+}
+
+func newTestNetworkManager(t *testing.T, k6opts k6lib.Options) (*NetworkManager, *fakeSession) {
+	t.Helper()
+
+	session := &fakeSession{
+		session: &Session{
+			id: "1234",
+		},
+	}
+
+	mr := k6mockresolver.New(map[string][]net.IP{
+		mockHostname: {
+			net.ParseIP("127.0.0.10"),
+			net.ParseIP("127.0.0.11"),
+			net.ParseIP("127.0.0.12"),
+			net.ParseIP("2001:db8::10"),
+			net.ParseIP("2001:db8::11"),
+			net.ParseIP("2001:db8::12"),
+		},
+	})
+
+	vu := k6test.NewVU(t)
+	vu.ActivateVU()
+	ctx := vu.Context()
+	st := vu.State()
+	st.Options = k6opts
+	logger := log.New(st.Logger, "")
+	timeoutSettings := NewTimeoutSettings(nil)
+	frameManager := NewFrameManager(ctx, nil, nil, timeoutSettings, logger)
+
+	nm := &NetworkManager{
+		ctx:                           ctx,
+		logger:                        logger,
+		session:                       session,
+		frameManager:                  frameManager,
+		resolver:                      mr,
+		vu:                            vu,
+		reqIDToRequest:                map[network.RequestID]*Request{},
+		reqIDToRequestWillBeSentEvent: make(map[network.RequestID]*network.EventRequestWillBeSent),
+		reqIDToRequestPausedEvent:     make(map[network.RequestID]*fetch.EventRequestPaused),
+	}
+
+	return nm, session
+}
+
+func TestOnRequestPausedBlockedHostnames(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name, reqURL                  string
+		blockedHostnames, expCDPCalls []string
+	}{
+		{
+			name:             "ok_fail_simple",
+			blockedHostnames: []string{"*.test"},
+			reqURL:           fmt.Sprintf("http://%s/", mockHostname),
+			expCDPCalls:      []string{"Fetch.failRequest"},
+		},
+		{
+			name:             "ok_continue_simple",
+			blockedHostnames: []string{"*.test"},
+			reqURL:           "http://host.com/",
+			expCDPCalls:      []string{"Fetch.continueRequest"},
+		},
+		{
+			name:             "ok_continue_empty",
+			blockedHostnames: nil,
+			reqURL:           "http://host.com/",
+			expCDPCalls:      []string{"Fetch.continueRequest"},
+		},
+		{
+			name:             "ok_continue_ip",
+			blockedHostnames: []string{"*.test"},
+			reqURL:           "http://127.0.0.1:8000/",
+			expCDPCalls:      []string{"Fetch.continueRequest"},
+		},
+		{
+			name:             "err_url_continue",
+			blockedHostnames: []string{"*.test"},
+			reqURL:           ":::",
+			expCDPCalls:      []string{"Fetch.continueRequest"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			blocked, err := k6types.NewNullHostnameTrie(tc.blockedHostnames)
+			require.NoError(t, err)
+
+			k6opts := k6lib.Options{BlockedHostnames: blocked}
+			nm, session := newTestNetworkManager(t, k6opts)
+			ev := &fetch.EventRequestPaused{
+				RequestID: "1234",
+				Request: &network.Request{
+					Method: "GET",
+					URL:    tc.reqURL,
+				},
+			}
+
+			nm.onRequestPaused(ev)
+
+			assert.Equal(t, tc.expCDPCalls, session.cdpCalls)
+		})
+	}
+}
+
+func TestOnRequestPausedBlockedIPs(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name, reqURL            string
+		blockedIPs, expCDPCalls []string
+	}{
+		{
+			name:        "ok_fail_simple",
+			blockedIPs:  []string{"10.0.0.0/8", "192.168.0.0/16"},
+			reqURL:      "http://10.0.0.1:8000/",
+			expCDPCalls: []string{"Fetch.failRequest"},
+		},
+		{
+			name:        "ok_fail_resolved_ip",
+			blockedIPs:  []string{"127.0.0.10/32"},
+			reqURL:      fmt.Sprintf("http://%s/", mockHostname),
+			expCDPCalls: []string{"Fetch.failRequest"},
+		},
+		{
+			name:        "ok_continue_resolved_ip",
+			blockedIPs:  []string{"127.0.0.50/32"},
+			reqURL:      fmt.Sprintf("http://%s/", mockHostname),
+			expCDPCalls: []string{"Fetch.continueRequest"},
+		},
+		{
+			name:        "ok_continue_simple",
+			blockedIPs:  []string{"127.0.0.0/8"},
+			reqURL:      "http://10.0.0.1:8000/",
+			expCDPCalls: []string{"Fetch.continueRequest"},
+		},
+		{
+			name:        "ok_continue_empty",
+			blockedIPs:  nil,
+			reqURL:      "http://127.0.0.1/",
+			expCDPCalls: []string{"Fetch.continueRequest"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			blockedIPs := make([]*k6lib.IPNet, len(tc.blockedIPs))
+			for i, ipcidr := range tc.blockedIPs {
+				ipnet, err := k6lib.ParseCIDR(ipcidr)
+				require.NoError(t, err)
+				blockedIPs[i] = ipnet
+			}
+
+			k6opts := k6lib.Options{BlacklistIPs: blockedIPs}
+			nm, session := newTestNetworkManager(t, k6opts)
+			ev := &fetch.EventRequestPaused{
+				RequestID: "1234",
+				Request: &network.Request{
+					Method: "GET",
+					URL:    tc.reqURL,
+				},
+			}
+
+			nm.onRequestPaused(ev)
+
+			assert.Equal(t, tc.expCDPCalls, session.cdpCalls)
+		})
+	}
+}
+
+type EventInterceptorMock struct{}
+
+func (m *EventInterceptorMock) urlTagName(_ string, _ string) (string, bool) {
+	return "", false
+}
+
+func (m *EventInterceptorMock) onRequest(_ *Request) {}
+
+func (m *EventInterceptorMock) onResponse(_ *Response) {}
+
+func (m *EventInterceptorMock) onRequestFinished(_ *Request) {}
+
+func (m *EventInterceptorMock) onRequestFailed(_ *Request) {}
+
+func TestNetworkManagerEmitRequestResponseMetricsTimingSkew(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	type tm struct{ ts, wt time.Time }
+	tests := []struct {
+		name                       string
+		req, res, wantReq, wantRes tm
+	}{
+		{
+			name:    "ok",
+			req:     tm{ts: now, wt: now},
+			res:     tm{ts: now, wt: now},
+			wantReq: tm{wt: now},
+			wantRes: tm{wt: now},
+		},
+		{
+			name:    "ok2",
+			req:     tm{ts: now, wt: now},
+			res:     tm{ts: now.Add(time.Minute)},
+			wantReq: tm{wt: now},
+			wantRes: tm{wt: now.Add(time.Minute)},
+		},
+		{
+			name:    "ts_past",
+			req:     tm{ts: now.Add(-time.Hour), wt: now},
+			res:     tm{ts: now.Add(-time.Hour).Add(time.Minute)},
+			wantReq: tm{wt: now},
+			wantRes: tm{wt: now.Add(time.Minute)},
+		},
+		{
+			name:    "ts_future",
+			req:     tm{ts: now.Add(time.Hour), wt: now},
+			res:     tm{ts: now.Add(time.Hour).Add(time.Minute)},
+			wantReq: tm{wt: now},
+			wantRes: tm{wt: now.Add(time.Minute)},
+		},
+		{
+			name:    "wt_past",
+			req:     tm{ts: now, wt: now.Add(-time.Hour)},
+			res:     tm{ts: now.Add(time.Minute)},
+			wantReq: tm{wt: now.Add(-time.Hour)},
+			wantRes: tm{wt: now.Add(-time.Hour).Add(time.Minute)},
+		},
+		{
+			name:    "wt_future",
+			req:     tm{ts: now, wt: now.Add(time.Hour)},
+			res:     tm{ts: now.Add(time.Minute)},
+			wantReq: tm{wt: now.Add(time.Hour)},
+			wantRes: tm{wt: now.Add(time.Hour).Add(time.Minute)},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			registry := k6metrics.NewRegistry()
+			k6m := k6ext.RegisterCustomMetrics(registry)
+
+			var (
+				vu = k6test.NewVU(t)
+				nm = &NetworkManager{ctx: vu.Context(), vu: vu, customMetrics: k6m, eventInterceptor: &EventInterceptorMock{}}
+			)
+			vu.ActivateVU()
+
+			req, err := NewRequest(vu.Context(), log.NewNullLogger(), NewRequestParams{
+				event: &network.EventRequestWillBeSent{
+					Request:   &network.Request{},
+					Timestamp: cdp.MonotonicTime(float64(tt.req.ts.UnixNano()) / 1e9),
+					WallTime:  cdp.TimeSinceEpoch(float64(tt.req.wt.UnixNano()) / 1e9),
+				},
+			})
+			require.NoError(t, err)
+			nm.emitRequestMetrics(req)
+			n := vu.AssertSamples(func(s k6metrics.Sample) {
+				assert.WithinDurationf(t, tt.wantReq.wt, s.Time, time.Microsecond, "timing skew in %s", s.Metric.Name)
+			})
+			assert.Equalf(t, 1, n, "should emit %d request metric", 1)
+			res := NewHTTPResponse(vu.Context(), req,
+				&network.Response{Timing: &network.ResourceTiming{}},
+				cdp.MonotonicTime(float64(tt.res.ts.UnixNano())/1e9),
+			)
+			nm.emitResponseMetrics(res, req, 1)
+			n = vu.AssertSamples(func(s k6metrics.Sample) {
+				assert.WithinDurationf(t, tt.wantRes.wt, s.Time, time.Microsecond, "timing skew in %s", s.Metric.Name)
+			})
+			assert.Equalf(t, 3, n, "should emit 8 response metrics")
+		})
+	}
+}
+
+func TestNetworkManagerMetricsRetainRequestTagsAndMetadata(t *testing.T) {
+	t.Parallel()
+
+	registry := k6metrics.NewRegistry()
+	k6m := k6ext.RegisterCustomMetrics(registry)
+	vu := k6test.NewVU(t)
+	vu.ActivateVU()
+
+	state := vu.State()
+	state.Tags.Modify(func(tagsAndMeta *k6metrics.TagsAndMeta) {
+		tagsAndMeta.SetTag(k6metrics.TagGroup.String(), "::request")
+		tagsAndMeta.SetTag("phase", "request")
+		tagsAndMeta.SetMetadata("trace", "request")
+	})
+
+	now := time.Now()
+	req, err := NewRequest(vu.Context(), log.NewNullLogger(), NewRequestParams{
+		event: &network.EventRequestWillBeSent{
+			Request:   &network.Request{URL: "https://example.test/"},
+			Timestamp: cdp.MonotonicTime(float64(now.UnixNano()) / 1e9),
+			WallTime:  cdp.TimeSinceEpoch(float64(now.UnixNano()) / 1e9),
+		},
+		tagsAndMeta: state.Tags.GetCurrentValues(),
+	})
+	require.NoError(t, err)
+
+	state.Tags.Modify(func(tagsAndMeta *k6metrics.TagsAndMeta) {
+		tagsAndMeta.SetTag(k6metrics.TagGroup.String(), "")
+		tagsAndMeta.SetTag("phase", "after")
+		tagsAndMeta.SetMetadata("trace", "after")
+	})
+
+	nm := &NetworkManager{
+		ctx:              vu.Context(),
+		vu:               vu,
+		customMetrics:    k6m,
+		eventInterceptor: &EventInterceptorMock{},
+	}
+	nm.emitRequestMetrics(req)
+	resp := NewHTTPResponse(vu.Context(), req, &network.Response{
+		URL:    req.URL(),
+		Timing: &network.ResourceTiming{},
+	}, cdp.MonotonicTime(float64(now.UnixNano())/1e9))
+	nm.emitResponseMetrics(resp, req, 1)
+
+	n := vu.AssertSamples(func(sample k6metrics.Sample) {
+		group, ok := sample.Tags.Get(k6metrics.TagGroup.String())
+		require.True(t, ok)
+		assert.Equal(t, "::request", group)
+		phase, ok := sample.Tags.Get("phase")
+		require.True(t, ok)
+		assert.Equal(t, "request", phase)
+		assert.Equal(t, "request", sample.Metadata["trace"])
+	})
+	assert.Equal(t, 4, n)
+}
+
+func TestBrowserDataReceivedUsesEncodedDataLength(t *testing.T) {
+	t.Parallel()
+
+	registry := k6metrics.NewRegistry()
+	k6m := k6ext.RegisterCustomMetrics(registry)
+	vu := k6test.NewVU(t)
+	vu.ActivateVU()
+
+	nm := &NetworkManager{
+		ctx:              vu.Context(),
+		vu:               vu,
+		customMetrics:    k6m,
+		eventInterceptor: &EventInterceptorMock{},
+	}
+
+	now := time.Now()
+	req, err := NewRequest(vu.Context(), log.NewNullLogger(), NewRequestParams{
+		event: &network.EventRequestWillBeSent{
+			Request:   &network.Request{URL: "https://example.test/"},
+			Timestamp: cdp.MonotonicTime(float64(now.UnixNano()) / 1e9),
+			WallTime:  cdp.TimeSinceEpoch(float64(now.UnixNano()) / 1e9),
+		},
+		tagsAndMeta: vu.State().Tags.GetCurrentValues(),
+	})
+	require.NoError(t, err)
+
+	encodedDataLength := 12345.0
+	resp := NewHTTPResponse(vu.Context(), req, &network.Response{
+		URL:    req.URL(),
+		Timing: &network.ResourceTiming{},
+	}, cdp.MonotonicTime(float64(now.UnixNano())/1e9))
+	nm.emitResponseMetrics(resp, req, encodedDataLength)
+
+	foundDataReceived := false
+	vu.AssertSamples(func(sample k6metrics.Sample) {
+		if sample.Metric == k6m.BrowserDataReceived {
+			foundDataReceived = true
+			assert.Equal(t, encodedDataLength, sample.Value)
+		}
+	})
+
+	assert.True(t, foundDataReceived)
+}
+
+func TestBrowserDataReceivedOmitsNegativeEncodedDataLength(t *testing.T) {
+	t.Parallel()
+
+	registry := k6metrics.NewRegistry()
+	k6m := k6ext.RegisterCustomMetrics(registry)
+	vu := k6test.NewVU(t)
+	vu.ActivateVU()
+
+	nm := &NetworkManager{
+		ctx:              vu.Context(),
+		vu:               vu,
+		customMetrics:    k6m,
+		eventInterceptor: &EventInterceptorMock{},
+	}
+
+	now := time.Now()
+	req, err := NewRequest(vu.Context(), log.NewNullLogger(), NewRequestParams{
+		event: &network.EventRequestWillBeSent{
+			Request:   &network.Request{URL: "https://example.test/"},
+			Timestamp: cdp.MonotonicTime(float64(now.UnixNano()) / 1e9),
+			WallTime:  cdp.TimeSinceEpoch(float64(now.UnixNano()) / 1e9),
+		},
+		tagsAndMeta: vu.State().Tags.GetCurrentValues(),
+	})
+	require.NoError(t, err)
+
+	resp := NewHTTPResponse(vu.Context(), req, &network.Response{
+		URL:    req.URL(),
+		Timing: &network.ResourceTiming{},
+	}, cdp.MonotonicTime(float64(now.UnixNano())/1e9))
+
+	nm.emitResponseMetrics(resp, req, -1)
+
+	foundDataReceived := false
+	foundDuration := false
+	vu.AssertSamples(func(sample k6metrics.Sample) {
+		if sample.Metric == k6m.BrowserDataReceived {
+			foundDataReceived = true
+		}
+		if sample.Metric == k6m.BrowserHTTPReqDuration {
+			foundDuration = true
+		}
+	})
+
+	assert.False(t, foundDataReceived)
+	assert.True(t, foundDuration)
+}
+
+func TestNetworkManagerRedirectKeepsLoaderOperation(t *testing.T) {
+	t.Parallel()
+
+	nm, _ := newTestNetworkManager(t, k6lib.Options{})
+	state := nm.vu.State()
+	state.FeatureFlags = &features.Flags{AsyncMetricContext: true}
+	page := &Page{}
+	nm.frameManager.page = page
+
+	state.Tags.Modify(func(tagsAndMeta *k6metrics.TagsAndMeta) {
+		tagsAndMeta.SetTag("operation", "navigation")
+	})
+	navigationFinishAndRetain, _ := page.BeginNetworkOperation(state.Tags.GetCurrentValues())
+	navigationTags, navigationOperation := nm.networkTagsAndMeta(state, &network.EventRequestWillBeSent{
+		FrameID:  cdp.FrameID("frame"),
+		LoaderID: cdp.LoaderID("initial-loader"),
+		Type:     network.ResourceTypeDocument,
+	}, nil)
+	require.NotNil(t, navigationOperation)
+	navigationFinishAndRetain()
+
+	state.Tags.Modify(func(tagsAndMeta *k6metrics.TagsAndMeta) {
+		tagsAndMeta.SetTag("operation", "unrelated")
+	})
+	unrelatedFinishAndRetain, _ := page.BeginNetworkOperation(state.Tags.GetCurrentValues())
+	defer unrelatedFinishAndRetain()
+
+	redirectTags, redirectOperation := nm.networkTagsAndMeta(state, &network.EventRequestWillBeSent{
+		FrameID:  cdp.FrameID("frame"),
+		LoaderID: cdp.LoaderID("redirect-loader"),
+		Type:     network.ResourceTypeDocument,
+	}, []*Request{{
+		tagsAndMeta:      navigationTags,
+		networkOperation: navigationOperation,
+	}})
+	assert.Same(t, navigationOperation, redirectOperation)
+	operation, _ := redirectTags.Tags.Get("operation")
+	assert.Equal(t, "navigation", operation)
+
+	loaderTags, loaderOperation, ok := page.getNetworkTagsAndMetaForRequest(
+		cdp.FrameID("frame"), cdp.LoaderID("redirect-loader"), true, false,
+	)
+	require.True(t, ok)
+	assert.Same(t, navigationOperation, loaderOperation)
+	operation, _ = loaderTags.Tags.Get("operation")
+	assert.Equal(t, "navigation", operation)
+}
+
+func TestRequestLoaderContext(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name      string
+		typ       network.ResourceType
+		initiator *network.Initiator
+		prefer    bool
+		bind      bool
+	}{
+		{name: "document", typ: network.ResourceTypeDocument, prefer: true, bind: true},
+		{name: "parser", initiator: &network.Initiator{Type: network.InitiatorTypeParser}, prefer: true},
+		{name: "preload", initiator: &network.Initiator{Type: network.InitiatorTypePreload}, prefer: true},
+		{
+			name:      "signed exchange",
+			initiator: &network.Initiator{Type: network.InitiatorTypeSignedExchange},
+			prefer:    true,
+		},
+		{name: "script", initiator: &network.Initiator{Type: network.InitiatorTypeScript}},
+		{name: "preflight", initiator: &network.Initiator{Type: network.InitiatorTypePreflight}},
+		{name: "unknown initiator"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			prefer, bind := requestLoaderContext(&network.EventRequestWillBeSent{
+				Type:      testCase.typ,
+				Initiator: testCase.initiator,
+			})
+			assert.Equal(t, testCase.prefer, prefer)
+			assert.Equal(t, testCase.bind, bind)
+		})
+	}
+}
+
+func TestRequestForOnLoadingFinished(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		ID      network.RequestID
+		request *Request
+		parent  *Request
+		want    *Request
+	}{
+		"non_nil_request": {
+			ID: "1234",
+			request: &Request{
+				requestID:  "1234",
+				documentID: "1234",
+			},
+			want: &Request{
+				requestID:  "1234",
+				documentID: "1234",
+			},
+		},
+		"non_nil_request_with_parent": {
+			ID: "1234",
+			request: &Request{
+				requestID:  "1234",
+				documentID: "1234",
+			},
+			parent: &Request{
+				documentID: "3421",
+			},
+			want: &Request{
+				requestID:  "1234",
+				documentID: "1234",
+			},
+		},
+		"nil_request": {
+			request: nil,
+			want:    nil,
+		},
+		"nil_request_with_non_nil_parent_with_matching_document_id": {
+			ID:      "1234",
+			request: nil,
+			parent: &Request{
+				requestID:  "1234",
+				documentID: "1234",
+			},
+			want: &Request{
+				requestID:  "1234",
+				documentID: "1234",
+			},
+		},
+		"nil_request_with_non_nil_parent_with_non_matching_document_id": {
+			ID:      "1234",
+			request: nil,
+			parent: &Request{
+				requestID:  "1234",
+				documentID: "4321",
+			},
+			want: nil,
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			nm, _ := newTestNetworkManager(t, k6lib.Options{})
+			nm.parent, _ = newTestNetworkManager(t, k6lib.Options{})
+
+			if tt.request != nil {
+				tt.request.requestID = tt.ID
+				nm.reqIDToRequest[tt.ID] = tt.request
+			}
+			if tt.parent != nil {
+				nm.parent.reqIDToRequest[tt.parent.requestID] = tt.parent
+			}
+
+			r := nm.requestForOnLoadingFinished(tt.ID)
+			if tt.want == nil {
+				require.Nil(t, r)
+				return
+			}
+			require.NotNil(t, r)
+			assert.Equal(t, tt.want, r)
+		})
+	}
+}
+
+func TestCredentials_IsEmpty(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name     string
+		creds    Credentials
+		expected bool
+	}{
+		{
+			name:     "empty struct",
+			creds:    Credentials{},
+			expected: true,
+		},
+		{
+			name: "valid credentials",
+			creds: Credentials{
+				Username: "admin",
+				Password: "secretpassword",
+			},
+			expected: false,
+		},
+		{
+			name: "whitespace only",
+			creds: Credentials{
+				Username: "   ",
+				Password: " \t\n ",
+			},
+			expected: true,
+		},
+		{
+			name: "username only",
+			creds: Credentials{
+				Username: "admin",
+				Password: "",
+			},
+			expected: false,
+		},
+		{
+			name: "password only",
+			creds: Credentials{
+				Username: "",
+				Password: "secretpassword",
+			},
+			expected: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.expected, tc.creds.IsEmpty())
+		})
+	}
+}

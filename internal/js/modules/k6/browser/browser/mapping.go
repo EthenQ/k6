@@ -1,0 +1,369 @@
+package browser
+
+import (
+	"fmt"
+	"reflect"
+	"sync"
+	"time"
+
+	"github.com/grafana/sobek"
+
+	"go.k6.io/k6/v2/internal/js/modules/k6/browser/common"
+	"go.k6.io/k6/v2/internal/js/modules/k6/browser/k6ext"
+
+	k6common "go.k6.io/k6/v2/js/common"
+)
+
+// mapping is a type for mapping our module API to sobek.
+// It acts like a bridge and allows adding wildcard methods
+// and customization over our API.
+type mapping = map[string]any
+
+type mappingCallKind uint8
+
+const (
+	mappingCallPassive mappingCallKind = iota + 1
+	mappingCallNetwork
+)
+
+type mappingCall struct {
+	fn   any
+	kind mappingCallKind
+}
+
+// Browser requests can arrive after the mapped call that initiated them settles. Requiring every
+// callable to choose a kind prevents a passive waiter from silently becoming a competing operation.
+func passiveCall(fn any) mappingCall {
+	return mappingCall{fn: fn, kind: mappingCallPassive}
+}
+
+func networkCall(fn any) mappingCall {
+	return mappingCall{fn: fn, kind: mappingCallNetwork}
+}
+
+func finishMapping(m mapping) mapping {
+	return finishMappingCalls(moduleVU{}, m, nil, "")
+}
+
+func withPageNetworkCalls(vu moduleVU, page *common.Page, m mapping) mapping {
+	var begin func() (finishAndRetain, abortAndDiscard func())
+	if page != nil && k6common.AsyncMetricContextEnabled(vu.State()) {
+		begin = func() (finishAndRetain, abortAndDiscard func()) {
+			state := vu.State()
+			if state == nil || state.Tags == nil {
+				return func() {}, func() {}
+			}
+			return page.BeginNetworkOperation(state.Tags.GetCurrentValues())
+		}
+	}
+	return finishMappingCalls(vu, m, begin, "")
+}
+
+func finishMappingCalls(
+	vu moduleVU,
+	m mapping,
+	begin func() (finishAndRetain, abortAndDiscard func()),
+	path string,
+) mapping {
+	for name, value := range m {
+		callPath := name
+		if path != "" {
+			callPath = path + "." + name
+		}
+		switch value := value.(type) {
+		case mapping:
+			m[name] = finishMappingCalls(vu, value, begin, callPath)
+		case mappingCall:
+			fn := reflect.ValueOf(value.fn)
+			if !fn.IsValid() || fn.Kind() != reflect.Func {
+				panic(fmt.Sprintf("browser mapping %q classifies non-callable %T", callPath, value.fn))
+			}
+			switch value.kind {
+			case mappingCallPassive:
+				m[name] = value.fn
+			case mappingCallNetwork:
+				if begin == nil {
+					m[name] = value.fn
+					break
+				}
+				m[name], _ = aroundMappingCall(vu, value.fn, begin)
+			default:
+				panic(fmt.Sprintf("browser mapping call %q has invalid classification", callPath))
+			}
+		default:
+			valueType := reflect.TypeOf(value)
+			if valueType != nil && valueType.Kind() == reflect.Func {
+				panic(fmt.Sprintf("browser mapping call %q must be classified", callPath))
+			}
+			m[name] = value
+		}
+	}
+	return m
+}
+
+func aroundMappingCalls(
+	vu moduleVU,
+	m mapping,
+	begin func() (finishAndRetain, abortAndDiscard func()),
+) mapping {
+	return finishMappingCalls(vu, m, begin, "")
+}
+
+func aroundMappingCall(
+	vu moduleVU,
+	value any,
+	begin func() (finishAndRetain, abortAndDiscard func()),
+) (any, bool) {
+	original := reflect.ValueOf(value)
+	if original.Kind() != reflect.Func {
+		return nil, false
+	}
+	wrapped := reflect.MakeFunc(original.Type(), func(args []reflect.Value) []reflect.Value {
+		finishAndRetain, abortAndDiscard := begin()
+		operationLaunched := false
+		defer func() {
+			if !operationLaunched {
+				abortAndDiscard()
+			}
+		}()
+
+		results := callMapping(original, args)
+		if mappingCallFailed(results) {
+			return results
+		}
+		operationLaunched = wrapMappingPromise(vu, results, finishAndRetain)
+		if !operationLaunched {
+			finishAndRetain()
+			operationLaunched = true
+		}
+		return results
+	})
+	return wrapped.Interface(), true
+}
+
+func callMapping(fn reflect.Value, args []reflect.Value) []reflect.Value {
+	if fn.Type().IsVariadic() {
+		return fn.CallSlice(args)
+	}
+	return fn.Call(args)
+}
+
+func mappingCallFailed(results []reflect.Value) bool {
+	for _, result := range results {
+		if err, ok := reflect.TypeAssert[error](result); ok && err != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func wrapMappingPromise(vu moduleVU, results []reflect.Value, finishAndRetain func()) bool {
+	for i, result := range results {
+		promise, ok := reflect.TypeAssert[*sobek.Promise](result)
+		if !ok || promise == nil {
+			continue
+		}
+		results[i] = reflect.ValueOf(endOperationOnPromiseSettlement(vu, promise, finishAndRetain))
+		return true
+	}
+	return false
+}
+
+func endOperationOnPromiseSettlement(
+	vu moduleVU,
+	promise *sobek.Promise,
+	finishAndRetain func(),
+) *sobek.Promise {
+	rt := vu.Runtime()
+	wrapped, resolve, reject := rt.NewPromise()
+	finishAndRetain = sync.OnceFunc(finishAndRetain)
+
+	onFulfilled := func(call sobek.FunctionCall) sobek.Value {
+		finishAndRetain()
+		if err := resolve(call.Argument(0)); err != nil {
+			k6common.Throw(rt, err)
+		}
+		return sobek.Undefined()
+	}
+	onRejected := func(call sobek.FunctionCall) sobek.Value {
+		// Rejection means the launched operation settled unsuccessfully, not that it never
+		// reached the browser. Retain its context for related CDP requests observed afterward.
+		finishAndRetain()
+		if err := reject(call.Argument(0)); err != nil {
+			k6common.Throw(rt, err)
+		}
+		return sobek.Undefined()
+	}
+
+	then, ok := sobek.AssertFunction(rt.ToValue(promise).ToObject(rt).Get("then"))
+	if !ok {
+		panic("browser promise has no callable then method")
+	}
+	if _, err := then(
+		rt.ToValue(promise),
+		rt.ToValue(onFulfilled),
+		rt.ToValue(onRejected),
+	); err != nil {
+		finishAndRetain()
+		if rejectErr := reject(err); rejectErr != nil {
+			k6common.Throw(rt, rejectErr)
+		}
+	}
+	return wrapped
+}
+
+// mapToSobek maps a browser-module mapping to a Sobek object.
+// The motivation of this mapping was to support $ and $$ wildcard
+// methods.
+// See issue #661 for more details.
+func mapToSobek(vu moduleVU, m mapping) *sobek.Object {
+	var (
+		rt  = vu.Runtime()
+		obj = rt.NewObject()
+	)
+	for k, v := range m {
+		if err := obj.Set(k, rt.ToValue(v)); err != nil {
+			k6common.Throw(rt, k6ext.BrowserError(fmt.Errorf("mapping: %w", err)))
+		}
+	}
+
+	return obj
+}
+
+func parseFrameClickOptions(
+	rt *sobek.Runtime, opts sobek.Value, defaultTimeout time.Duration,
+) (*common.FrameClickOptions, error) {
+	copts := common.NewFrameClickOptions(defaultTimeout)
+	if k6common.IsNullish(opts) {
+		return copts, nil
+	}
+
+	ehcopts, err := parseElementHandleClickOptions(rt, opts, defaultTimeout)
+	if err != nil {
+		return copts, err
+	}
+
+	copts.ElementHandleClickOptions = *ehcopts
+	copts.Strict = parseStrict(rt, opts)
+
+	return copts, nil
+}
+
+func ConvertSelectOptionValues(rt *sobek.Runtime, values sobek.Value) ([]any, error) {
+	if k6common.IsNullish(values) {
+		return nil, nil
+	}
+
+	var (
+		opts []any
+		t    = values.Export()
+	)
+	switch values.ExportType().Kind() {
+	case reflect.Slice:
+		var sl []any
+		if err := rt.ExportTo(values, &sl); err != nil {
+			return nil, fmt.Errorf("options: expected array, got %T", values)
+		}
+
+		for _, item := range sl {
+			switch item := item.(type) {
+			case string:
+				// Strings will match values or labels
+				valOpt := common.SelectOption{Value: new(string)}
+				*valOpt.Value = item
+				labelOpt := common.SelectOption{Label: new(string)}
+				*labelOpt.Label = item
+				opts = append(opts, &valOpt, &labelOpt)
+			case map[string]any:
+				opt, err := extractSelectOptionFromMap(item)
+				if err != nil {
+					return nil, err
+				}
+
+				opts = append(opts, opt)
+			default:
+				return nil, fmt.Errorf("options: expected string or object, got %T", item)
+			}
+		}
+	case reflect.Map:
+		var raw map[string]any
+		if err := rt.ExportTo(values, &raw); err != nil {
+			return nil, fmt.Errorf("options: expected object, got %T", values)
+		}
+
+		opt, err := extractSelectOptionFromMap(raw)
+		if err != nil {
+			return nil, err
+		}
+
+		opts = append(opts, opt)
+	case reflect.TypeFor[*common.ElementHandle]().Kind():
+		opts = append(opts, t.(*common.ElementHandle)) //nolint:forcetypeassert
+	case reflect.TypeFor[sobek.Object]().Kind():
+		obj := values.ToObject(rt)
+		opt := common.SelectOption{}
+		for _, k := range obj.Keys() {
+			switch k {
+			case "value":
+				opt.Value = new(string)
+				*opt.Value = obj.Get(k).String()
+			case "label":
+				opt.Label = new(string)
+				*opt.Label = obj.Get(k).String()
+			case "index":
+				opt.Index = new(int64)
+				*opt.Index = obj.Get(k).ToInteger()
+			}
+		}
+		opts = append(opts, &opt)
+	case reflect.String:
+		// Strings will match values or labels
+		valOpt := common.SelectOption{Value: new(string)}
+		*valOpt.Value = t.(string) //nolint:forcetypeassert
+		labelOpt := common.SelectOption{Label: new(string)}
+		*labelOpt.Label = t.(string) //nolint:forcetypeassert
+		opts = append(opts, &valOpt, &labelOpt)
+	default:
+		return nil, fmt.Errorf("options: unsupported type %T", values)
+	}
+
+	return opts, nil
+}
+
+func extractSelectOptionFromMap(v map[string]any) (*common.SelectOption, error) {
+	opt := &common.SelectOption{}
+	for k, raw := range v {
+		switch k {
+		case "value":
+			opt.Value = new(string)
+
+			v, ok := raw.(string)
+			if !ok {
+				return nil, fmt.Errorf("options[%v]: expected string, got %T", k, raw)
+			}
+
+			*opt.Value = v
+		case "label":
+			opt.Label = new(string)
+
+			v, ok := raw.(string)
+			if !ok {
+				return nil, fmt.Errorf("options[%v]: expected string, got %T", k, raw)
+			}
+			*opt.Label = v
+		case "index":
+			opt.Index = new(int64)
+
+			switch raw := raw.(type) {
+			case int:
+				*opt.Index = int64(raw)
+			case int64:
+				*opt.Index = raw
+			default:
+				return nil, fmt.Errorf("options[%v]: expected int, got %T", k, raw)
+			}
+		}
+	}
+
+	return opt, nil
+}

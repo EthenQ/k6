@@ -1,55 +1,77 @@
-/*
- *
- * k6 - a next-generation load testing tool
- * Copyright (C) 2016 Load Impact
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of the
- * License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- */
-
 package html
 
 import (
-	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/dop251/goja"
-	"github.com/loadimpact/k6/js/common"
-	"github.com/pkg/errors"
+	"github.com/grafana/sobek"
 	gohtml "golang.org/x/net/html"
+
+	"go.k6.io/k6/v2/js/common"
+	"go.k6.io/k6/v2/js/modules"
 )
 
-type HTML struct{}
+// RootModule is the global module object type. It is instantiated once per test
+// run and will be used to create k6/html module instances for each VU.
+type RootModule struct{}
 
-func New() *HTML {
-	return &HTML{}
+// ModuleInstance represents an instance of the HTML module for every VU.
+type ModuleInstance struct {
+	vu         modules.VU
+	rootModule *RootModule
+	exports    *sobek.Object
 }
 
-func (HTML) ParseHTML(ctx context.Context, src string) (Selection, error) {
+var (
+	_ modules.Module   = &RootModule{}
+	_ modules.Instance = &ModuleInstance{}
+)
+
+// New returns a pointer to a new HTML RootModule.
+func New() *RootModule {
+	return &RootModule{}
+}
+
+// Exports returns the JS values this module exports.
+func (mi *ModuleInstance) Exports() modules.Exports {
+	return modules.Exports{
+		Default: mi.exports,
+	}
+}
+
+// NewModuleInstance returns an HTML module instance for each VU.
+func (r *RootModule) NewModuleInstance(vu modules.VU) modules.Instance {
+	rt := vu.Runtime()
+	mi := &ModuleInstance{
+		vu:         vu,
+		rootModule: r,
+		exports:    rt.NewObject(),
+	}
+	if err := mi.exports.Set("parseHTML", mi.parseHTML); err != nil {
+		common.Throw(rt, err)
+	}
+	return mi
+}
+
+func (mi *ModuleInstance) parseHTML(src string) (Selection, error) {
+	return ParseHTML(mi.vu.Runtime(), src)
+}
+
+// ParseHTML parses the provided HTML source into a Selection object.
+func ParseHTML(rt *sobek.Runtime, src string) (Selection, error) {
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(src))
 	if err != nil {
 		return Selection{}, err
 	}
-	return Selection{rt: common.GetRuntime(ctx), sel: doc.Selection}, nil
+	return Selection{rt: rt, sel: doc.Selection}, nil
 }
 
 type Selection struct {
-	rt  *goja.Runtime
+	rt  *sobek.Runtime
 	sel *goquery.Selection
-	URL string
+	URL string `json:"url"`
 }
 
 func (s Selection) emptySelection() Selection {
@@ -57,9 +79,9 @@ func (s Selection) emptySelection() Selection {
 	return s.Eq(s.Size())
 }
 
-func (s Selection) buildMatcher(v goja.Value, gojaFn goja.Callable) func(int, *goquery.Selection) bool {
+func (s Selection) buildMatcher(v sobek.Value, sobekFn sobek.Callable) func(int, *goquery.Selection) bool {
 	return func(idx int, sel *goquery.Selection) bool {
-		fnRes, fnErr := gojaFn(v, s.rt.ToValue(idx), s.rt.ToValue(sel))
+		fnRes, fnErr := sobekFn(v, s.rt.ToValue(idx), s.rt.ToValue(sel))
 		if fnErr != nil {
 			common.Throw(s.rt, fnErr)
 		}
@@ -68,11 +90,11 @@ func (s Selection) buildMatcher(v goja.Value, gojaFn goja.Callable) func(int, *g
 	}
 }
 
-func (s Selection) varargFnCall(arg interface{},
+func (s Selection) varargFnCall(arg any,
 	strFilter func(string) *goquery.Selection,
 	selFilter func(*goquery.Selection) *goquery.Selection,
-	nodeFilter func(...*gohtml.Node) *goquery.Selection) Selection {
-
+	nodeFilter func(...*gohtml.Node) *goquery.Selection,
+) Selection {
 	switch v := arg.(type) {
 	case Selection:
 		return Selection{s.rt, selFilter(v.sel), s.URL}
@@ -83,18 +105,19 @@ func (s Selection) varargFnCall(arg interface{},
 	case Element:
 		return Selection{s.rt, nodeFilter(v.node), s.URL}
 
-	case goja.Value:
+	case sobek.Value:
 		return s.varargFnCall(v.Export(), strFilter, selFilter, nodeFilter)
 
 	default:
-		errmsg := fmt.Sprintf("Invalid argument: Cannot use a %T as a selector", arg)
-		panic(s.rt.NewGoError(errors.New(errmsg)))
+		err := fmt.Errorf("invalid argument, cannot use a '%T' as a selector", arg)
+		panic(s.rt.NewGoError(err))
 	}
 }
 
 func (s Selection) adjacent(unfiltered func() *goquery.Selection,
 	filtered func(string) *goquery.Selection,
-	def ...string) Selection {
+	def ...string,
+) Selection {
 	if len(def) > 0 {
 		return Selection{s.rt, filtered(def[0]), s.URL}
 	}
@@ -106,8 +129,8 @@ func (s Selection) adjacentUntil(until func(string) *goquery.Selection,
 	untilSelection func(*goquery.Selection) *goquery.Selection,
 	filteredUntil func(string, string) *goquery.Selection,
 	filteredUntilSelection func(string, *goquery.Selection) *goquery.Selection,
-	def ...goja.Value) Selection {
-
+	def ...sobek.Value,
+) Selection {
 	switch len(def) {
 	case 0:
 		return Selection{s.rt, until(""), s.URL}
@@ -137,33 +160,41 @@ func (s Selection) adjacentUntil(until func(string) *goquery.Selection,
 		}
 	}
 
-	errmsg := fmt.Sprintf("Invalid argument: Cannot use a %T as a selector", def[0].Export())
-	panic(s.rt.NewGoError(errors.New(errmsg)))
+	err := fmt.Errorf("invalid argument, cannot use a '%T' as a selector", def[0].Export())
+	panic(s.rt.NewGoError(err))
 }
 
-func (s Selection) Add(arg interface{}) Selection {
+func (s Selection) Add(arg any) Selection {
 	return s.varargFnCall(arg, s.sel.Add, s.sel.AddSelection, s.sel.AddNodes)
 }
 
-func (s Selection) Find(arg interface{}) Selection {
+func (s Selection) Find(arg any) Selection {
 	return s.varargFnCall(arg, s.sel.Find, s.sel.FindSelection, s.sel.FindNodes)
 }
 
-func (s Selection) Closest(arg interface{}) Selection {
+func (s Selection) Single(selector string) Selection {
+	sel := s.sel.FindMatcher(goquery.Single(selector))
+	if len(sel.Nodes) > 1 {
+		sel.Nodes = sel.Nodes[:1]
+	}
+	return Selection{s.rt, sel, s.URL}
+}
+
+func (s Selection) Closest(arg any) Selection {
 	return s.varargFnCall(arg, s.sel.Closest, s.sel.ClosestSelection, s.sel.ClosestNodes)
 }
 
-func (s Selection) Has(arg interface{}) Selection {
+func (s Selection) Has(arg any) Selection {
 	return s.varargFnCall(arg, s.sel.Has, s.sel.HasSelection, s.sel.HasNodes)
 }
 
-func (s Selection) Not(v goja.Value) Selection {
-	gojaFn, isFn := goja.AssertFunction(v)
+func (s Selection) Not(v sobek.Value) Selection {
+	sobekFn, isFn := sobek.AssertFunction(v)
 	if !isFn {
 		return s.varargFnCall(v, s.sel.Not, s.sel.NotSelection, s.sel.NotNodes)
 	}
 
-	return Selection{s.rt, s.sel.NotFunction(s.buildMatcher(v, gojaFn)), s.URL}
+	return Selection{s.rt, s.sel.NotFunction(s.buildMatcher(v, sobekFn)), s.URL}
 }
 
 func (s Selection) Next(def ...string) Selection {
@@ -194,10 +225,11 @@ func (s Selection) Siblings(def ...string) Selection {
 	return s.adjacent(s.sel.Siblings, s.sel.SiblingsFiltered, def...)
 }
 
-// prevUntil, nextUntil and parentsUntil support two arguments with mutable type.
+// PrevUntil returns all preceding siblings of each element up to but not including the element matched by the selector.
+// The arguments are:
 // 1st argument is the selector. Either a selector string, a Selection object, or nil
 // 2nd argument is the filter. Either a selector string or nil/undefined
-func (s Selection) PrevUntil(def ...goja.Value) Selection {
+func (s Selection) PrevUntil(def ...sobek.Value) Selection {
 	return s.adjacentUntil(
 		s.sel.PrevUntil,
 		s.sel.PrevUntilSelection,
@@ -207,7 +239,11 @@ func (s Selection) PrevUntil(def ...goja.Value) Selection {
 	)
 }
 
-func (s Selection) NextUntil(def ...goja.Value) Selection {
+// NextUntil returns all following siblings of each element up to but not including the element matched by the selector.
+// The arguments are:
+// 1st argument is the selector. Either a selector string, a Selection object, or nil
+// 2nd argument is the filter. Either a selector string or nil/undefined
+func (s Selection) NextUntil(def ...sobek.Value) Selection {
 	return s.adjacentUntil(
 		s.sel.NextUntil,
 		s.sel.NextUntilSelection,
@@ -217,7 +253,12 @@ func (s Selection) NextUntil(def ...goja.Value) Selection {
 	)
 }
 
-func (s Selection) ParentsUntil(def ...goja.Value) Selection {
+// ParentsUntil returns the ancestors of each element in the current set of matched elements,
+// up to but not including the element matched by the selector
+// The arguments are:
+// 1st argument is the selector. Either a selector string, a Selection object, or nil
+// 2nd argument is the filter. Either a selector string or nil/undefined
+func (s Selection) ParentsUntil(def ...sobek.Value) Selection {
 	return s.adjacentUntil(
 		s.sel.ParentsUntil,
 		s.sel.ParentsUntilSelection,
@@ -255,27 +296,27 @@ func (s Selection) Text() string {
 	return s.sel.Text()
 }
 
-func (s Selection) Attr(name string, def ...goja.Value) goja.Value {
+func (s Selection) Attr(name string, def ...sobek.Value) sobek.Value {
 	val, exists := s.sel.Attr(name)
 	if !exists {
 		if len(def) > 0 {
 			return def[0]
 		}
-		return goja.Undefined()
+		return sobek.Undefined()
 	}
 	return s.rt.ToValue(val)
 }
 
-func (s Selection) Html() goja.Value {
+//nolint:revive // var-naming wants this to be HTML but this will break the API
+func (s Selection) Html() sobek.Value {
 	val, err := s.sel.Html()
 	if err != nil {
-		return goja.Undefined()
+		return sobek.Undefined()
 	}
 	return s.rt.ToValue(val)
 }
 
-// nolint: goconst
-func (s Selection) Val() goja.Value {
+func (s Selection) Val() sobek.Value {
 	switch goquery.NodeName(s.sel) {
 	case InputTagName:
 		val, exists := s.sel.Attr("value")
@@ -305,13 +346,13 @@ func (s Selection) Val() goja.Value {
 	case SelectTagName:
 		selected := s.sel.First().Find("option[selected]")
 		if _, exists := s.sel.Attr("multiple"); exists {
-			return s.rt.ToValue(selected.Map(func(idx int, opt *goquery.Selection) string { return valueOrHTML(opt) }))
+			return s.rt.ToValue(selected.Map(func(_ int, opt *goquery.Selection) string { return valueOrHTML(opt) }))
 		}
 
 		return s.rt.ToValue(valueOrHTML(selected))
 
 	default:
-		return goja.Undefined()
+		return sobek.Undefined()
 	}
 }
 
@@ -323,22 +364,22 @@ func (s Selection) Children(def ...string) Selection {
 	return Selection{s.rt, s.sel.ChildrenFiltered(def[0]), s.URL}
 }
 
-func (s Selection) Each(v goja.Value) Selection {
-	gojaFn, isFn := goja.AssertFunction(v)
+func (s Selection) Each(v sobek.Value) Selection {
+	sobekFn, isFn := sobek.AssertFunction(v)
 	if !isFn {
-		common.Throw(s.rt, errors.New("Argument to each() must be a function."))
+		common.Throw(s.rt, errors.New("the argument to each() must be a function"))
 	}
 
-	fn := func(idx int, sel *goquery.Selection) {
-		if _, err := gojaFn(v, s.rt.ToValue(idx), selToElement(Selection{s.rt, s.sel.Eq(idx), s.URL})); err != nil {
-			common.Throw(s.rt, errors.Wrap(err, "Function passed to each() failed."))
+	fn := func(idx int, _ *goquery.Selection) {
+		if _, err := sobekFn(v, s.rt.ToValue(idx), selToElement(Selection{s.rt, s.sel.Eq(idx), s.URL})); err != nil {
+			common.Throw(s.rt, fmt.Errorf("the function passed to each() failed: %w", err))
 		}
 	}
 
 	return Selection{s.rt, s.sel.Each(fn), s.URL}
 }
 
-func (s Selection) Filter(v goja.Value) Selection {
+func (s Selection) Filter(v sobek.Value) Selection {
 	switch val := v.Export().(type) {
 	case string:
 		return Selection{s.rt, s.sel.Filter(val), s.URL}
@@ -347,15 +388,15 @@ func (s Selection) Filter(v goja.Value) Selection {
 		return Selection{s.rt, s.sel.FilterSelection(val.sel), s.URL}
 	}
 
-	gojaFn, isFn := goja.AssertFunction(v)
+	sobekFn, isFn := sobek.AssertFunction(v)
 	if !isFn {
-		common.Throw(s.rt, errors.New("Argument to filter() must be a function, a selector or a selection"))
+		common.Throw(s.rt, errors.New("the argument to filter() must be a function, a selector or a selection"))
 	}
 
-	return Selection{s.rt, s.sel.FilterFunction(s.buildMatcher(v, gojaFn)), s.URL}
+	return Selection{s.rt, s.sel.FilterFunction(s.buildMatcher(v, sobekFn)), s.URL}
 }
 
-func (s Selection) Is(v goja.Value) bool {
+func (s Selection) Is(v sobek.Value) bool {
 	switch val := v.Export().(type) {
 	case string:
 		return s.sel.Is(val)
@@ -364,43 +405,49 @@ func (s Selection) Is(v goja.Value) bool {
 		return s.sel.IsSelection(val.sel)
 
 	default:
-		gojaFn, isFn := goja.AssertFunction(v)
+		sobekFn, isFn := sobek.AssertFunction(v)
 		if !isFn {
-			common.Throw(s.rt, errors.New("Argument to is() must be a function, a selector or a selection"))
+			common.Throw(s.rt, errors.New("the argument to is() must be a function, a selector or a selection"))
 		}
 
-		return s.sel.IsFunction(s.buildMatcher(v, gojaFn))
+		return s.sel.IsFunction(s.buildMatcher(v, sobekFn))
 	}
 }
 
-func (s Selection) Map(v goja.Value) (result []string) {
-	gojaFn, isFn := goja.AssertFunction(v)
+// Map implements ES5 Array.prototype.map
+func (s Selection) Map(v sobek.Value) []sobek.Value {
+	sobekFn, isFn := sobek.AssertFunction(v)
 	if !isFn {
-		common.Throw(s.rt, errors.New("Argument to map() must be a function"))
+		common.Throw(s.rt, errors.New("the argument to map() must be a function"))
 	}
 
-	fn := func(idx int, sel *goquery.Selection) string {
-		if fnRes, fnErr := gojaFn(v, s.rt.ToValue(idx), s.rt.ToValue(sel)); fnErr == nil {
-			return fnRes.String()
+	values := make([]sobek.Value, 0, s.sel.Length())
+	s.sel.Each(func(idx int, sel *goquery.Selection) {
+		selection := &Selection{sel: sel, URL: s.URL, rt: s.rt}
+
+		if fnRes, fnErr := sobekFn(v, s.rt.ToValue(idx), s.rt.ToValue(selection)); fnErr == nil {
+			values = append(values, fnRes)
 		}
-		return ""
-	}
+	})
 
-	return s.sel.Map(fn)
+	return values
 }
 
 func (s Selection) Slice(start int, def ...int) Selection {
-	if len(def) > 0 {
+	// We are forced to check that def[0] is inferior to the length of the array
+	// otherwise the s.sel.Slice panics. Besides returning the whole array when
+	// the end value for slicing is superior to the array length is standard in js.
+	if len(def) > 0 && def[0] < len(s.sel.Nodes) {
 		return Selection{s.rt, s.sel.Slice(start, def[0]), s.URL}
 	}
 
 	return Selection{s.rt, s.sel.Slice(start, s.sel.Length()), s.URL}
 }
 
-func (s Selection) Get(def ...int) goja.Value {
+func (s Selection) Get(def ...int) sobek.Value {
 	switch {
 	case len(def) == 0:
-		var items []goja.Value
+		items := make([]sobek.Value, 0, len(s.sel.Nodes))
 		for i := 0; i < len(s.sel.Nodes); i++ {
 			items = append(items, selToElement(s.Eq(i)))
 		}
@@ -410,7 +457,7 @@ func (s Selection) Get(def ...int) goja.Value {
 		return selToElement(s.Eq(def[0]))
 
 	default:
-		return goja.Undefined()
+		return sobek.Undefined()
 	}
 }
 
@@ -422,7 +469,7 @@ func (s Selection) ToArray() []Selection {
 	return items
 }
 
-func (s Selection) Index(def ...goja.Value) int {
+func (s Selection) Index(def ...sobek.Value) int {
 	if len(def) == 0 {
 		return s.sel.Index()
 	}
@@ -442,27 +489,28 @@ func (s Selection) Index(def ...goja.Value) int {
 	}
 }
 
+// Data return the value at the named data store for the first element in the set of matched elements.
+// Mimics jquery.data
+//
 // When 0 arguments: Read all data from attributes beginning with "data-".
 // When 1 argument: Append argument to "data-" then find for a matching attribute
-func (s Selection) Data(def ...string) goja.Value {
+func (s Selection) Data(def ...string) sobek.Value {
 	if s.sel.Length() == 0 || len(s.sel.Nodes[0].Attr) == 0 {
-		return goja.Undefined()
+		return sobek.Undefined()
 	}
 
 	if len(def) > 0 {
 		val, exists := s.sel.Attr("data-" + propertyToAttr(def[0]))
 		if exists {
 			return s.rt.ToValue(convertDataAttrVal(val))
-		} else {
-			return goja.Undefined()
 		}
-	} else {
-		data := make(map[string]interface{})
-		for _, attr := range s.sel.Nodes[0].Attr {
-			if strings.HasPrefix(attr.Key, "data-") && len(attr.Key) > 5 {
-				data[attrToProperty(attr.Key[5:])] = convertDataAttrVal(attr.Val)
-			}
-		}
-		return s.rt.ToValue(data)
+		return sobek.Undefined()
 	}
+	data := make(map[string]any)
+	for _, attr := range s.sel.Nodes[0].Attr {
+		if strings.HasPrefix(attr.Key, "data-") && len(attr.Key) > 5 {
+			data[attrToProperty(attr.Key[5:])] = convertDataAttrVal(attr.Val)
+		}
+	}
+	return s.rt.ToValue(data)
 }

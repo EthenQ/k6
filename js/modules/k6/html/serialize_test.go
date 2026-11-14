@@ -1,31 +1,9 @@
-/*
- *
- * k6 - a next-generation load testing tool
- * Copyright (C) 2016 Load Impact
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of the
- * License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- */
-
 package html
 
 import (
-	"context"
 	"testing"
 
-	"github.com/dop251/goja"
-	"github.com/loadimpact/k6/js/common"
+	"github.com/grafana/sobek"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -68,22 +46,18 @@ const testSerializeHTML = `
 `
 
 func TestSerialize(t *testing.T) {
-	rt := goja.New()
-	rt.SetFieldNameMapper(common.FieldNameMapper{})
-	ctx := common.WithRuntime(context.Background(), rt)
-	rt.Set("src", testSerializeHTML)
-	rt.Set("html", common.Bind(rt, New(), &ctx))
-
-	_, err := common.RunString(rt, `let doc = html.parseHTML(src)`)
-	assert.NoError(t, err)
-	assert.IsType(t, Selection{}, rt.Get("doc").Export())
+	t.Parallel()
 
 	t.Run("SerializeArray", func(t *testing.T) {
+		t.Parallel()
+		rt := getTestRuntimeWithDoc(t, testSerializeHTML)
+
 		t.Run("form", func(t *testing.T) {
-			v, err := common.RunString(rt, `doc.find("form").serializeArray()`)
+			v, err := rt.RunString(`doc.find("form").serializeArray()`)
 			if assert.NoError(t, err) {
-				arr := v.Export().([]FormValue)
-				assert.Equal(t, 11, len(arr))
+				arr, ok := v.Export().([]FormValue)
+				assert.True(t, ok)
+				assert.Len(t, arr, 11)
 
 				assert.Equal(t, "text_input", arr[0].Name)
 				assert.Equal(t, "input-text-value", arr[0].Value.String())
@@ -100,7 +74,9 @@ func TestSerialize(t *testing.T) {
 				assert.Equal(t, "select_text", arr[4].Name)
 				assert.Equal(t, "yes text", arr[4].Value.String())
 
-				multiValues := arr[5].Value.Export().([]string)
+				multiValues, ok := arr[5].Value.Export().([]string)
+
+				assert.True(t, ok)
 				assert.Equal(t, "select_multi", arr[5].Name)
 				assert.Equal(t, 2, len(multiValues))
 				assert.Equal(t, "option 2", multiValues[0])
@@ -124,10 +100,12 @@ func TestSerialize(t *testing.T) {
 		})
 
 		t.Run("controls", func(t *testing.T) {
-			v, err := common.RunString(rt, `doc.find("input").serializeArray()`)
+			v, err := rt.RunString(`doc.find("input").serializeArray()`)
 			if assert.NoError(t, err) {
-				arr := v.Export().([]FormValue)
-				assert.Equal(t, 7, len(arr))
+				arr, ok := v.Export().([]FormValue)
+
+				assert.True(t, ok)
+				assert.Len(t, arr, 7)
 
 				assert.Equal(t, "text_input", arr[0].Name)
 				assert.Equal(t, "input-text-value", arr[0].Value.String())
@@ -154,9 +132,14 @@ func TestSerialize(t *testing.T) {
 	})
 
 	t.Run("SerializeObject", func(t *testing.T) {
-		v, err := common.RunString(rt, `doc.find("form").serializeObject()`)
+		t.Parallel()
+		rt := getTestRuntimeWithDoc(t, testSerializeHTML)
+
+		v, err := rt.RunString(`doc.find("form").serializeObject()`)
 		if assert.NoError(t, err) {
-			obj := v.Export().(map[string]goja.Value)
+			obj, ok := v.Export().(map[string]sobek.Value)
+
+			assert.True(t, ok)
 			assert.Equal(t, 11, len(obj))
 
 			assert.Equal(t, "input-text-value", obj["text_input"].String())
@@ -170,14 +153,19 @@ func TestSerialize(t *testing.T) {
 			assert.Equal(t, "some radio", obj["radio1"].String())
 			assert.Equal(t, "on", obj["radio2"].String())
 
-			multiValues := obj["select_multi"].Export().([]string)
+			multiValues, ok := obj["select_multi"].Export().([]string)
+
+			assert.True(t, ok)
 			assert.Equal(t, "option 2", multiValues[0])
 			assert.Equal(t, "option 3", multiValues[1])
 		}
 	})
 
 	t.Run("Serialize", func(t *testing.T) {
-		v, err := common.RunString(rt, `doc.find("form").serialize()`)
+		t.Parallel()
+		rt := getTestRuntimeWithDoc(t, testSerializeHTML)
+
+		v, err := rt.RunString(`doc.find("form").serialize()`)
 		if assert.NoError(t, err) {
 			url := v.String()
 			assert.Equal(t, "checkbox1=some+checkbox"+
@@ -194,4 +182,26 @@ func TestSerialize(t *testing.T) {
 				"&textarea=Lorem+ipsum+dolor+sit+amet", url)
 		}
 	})
+}
+
+func TestSerializeBooleanAttributes(t *testing.T) {
+	t.Parallel()
+
+	// "checked" and "disabled" are boolean attributes: their presence alone
+	// sets them, whatever their value (or lack of one) is.
+	rt := getTestRuntimeWithDoc(t, `
+	<form>
+		<input type="checkbox" name="checkbox_bare" value="a" checked>
+		<input type="checkbox" name="checkbox_empty" value="b" checked="">
+		<input type="radio" name="radio_bare" value="c" checked>
+		<input type="checkbox" name="checkbox_unchecked" value="d">
+		<input type="text" name="text_disabled_bare" value="e" disabled>
+		<input type="text" name="text_disabled_empty" value="f" disabled="">
+		<input type="text" name="text_enabled" value="g">
+	</form>`)
+
+	v, err := rt.RunString(`doc.find("form").serialize()`)
+	if assert.NoError(t, err) {
+		assert.Equal(t, "checkbox_bare=a&checkbox_empty=b&radio_bare=c&text_enabled=g", v.String())
+	}
 }

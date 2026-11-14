@@ -5,7 +5,7 @@
 // Package ocsp parses OCSP responses as specified in RFC 2560. OCSP responses
 // are signed messages attesting to the validity of a certificate for a small
 // period of time. This is used to manage revocation for X.509 certificates.
-package ocsp // import "golang.org/x/crypto/ocsp"
+package ocsp
 
 import (
 	"crypto"
@@ -63,7 +63,7 @@ func (r ResponseStatus) String() string {
 }
 
 // ResponseError is an error that may be returned by ParseResponse to indicate
-// that the response itself is an error, not just that its indicating that a
+// that the response itself is an error, not just that it's indicating that a
 // certificate is revoked, unknown, etc.
 type ResponseError struct {
 	Status ResponseStatus
@@ -85,7 +85,8 @@ type certID struct {
 
 // https://tools.ietf.org/html/rfc2560#section-4.1.1
 type ocspRequest struct {
-	TBSRequest tbsRequest
+	TBSRequest        tbsRequest
+	OptionalSignature asn1.RawValue `asn1:"explicit,tag:0,optional"`
 }
 
 type tbsRequest struct {
@@ -279,21 +280,22 @@ func getOIDFromHashAlgorithm(target crypto.Hash) asn1.ObjectIdentifier {
 
 // This is the exposed reflection of the internal OCSP structures.
 
-// The status values that can be expressed in OCSP.  See RFC 6960.
+// The status values that can be expressed in OCSP. See RFC 6960.
+// These are used for the Response.Status field.
 const (
 	// Good means that the certificate is valid.
-	Good = iota
+	Good = 0
 	// Revoked means that the certificate has been deliberately revoked.
-	Revoked
+	Revoked = 1
 	// Unknown means that the OCSP responder doesn't know about the certificate.
-	Unknown
+	Unknown = 2
 	// ServerFailed is unused and was never used (see
 	// https://go-review.googlesource.com/#/c/18944). ParseResponse will
 	// return a ResponseError when an error response is parsed.
-	ServerFailed
+	ServerFailed = 3
 )
 
-// The enumerated reasons for revoking a certificate.  See RFC 5280.
+// The enumerated reasons for revoking a certificate. See RFC 5280.
 const (
 	Unspecified          = 0
 	KeyCompromise        = 1
@@ -320,10 +322,10 @@ type Request struct {
 func (req *Request) Marshal() ([]byte, error) {
 	hashAlg := getOIDFromHashAlgorithm(req.HashAlgorithm)
 	if hashAlg == nil {
-		return nil, errors.New("Unknown hash algorithm")
+		return nil, errors.New("unknown hash algorithm")
 	}
 	return asn1.Marshal(ocspRequest{
-		tbsRequest{
+		TBSRequest: tbsRequest{
 			Version: 0,
 			RequestList: []request{
 				{
@@ -345,6 +347,8 @@ func (req *Request) Marshal() ([]byte, error) {
 // Response represents an OCSP response containing a single SingleResponse. See
 // RFC 6960.
 type Response struct {
+	Raw []byte
+
 	// Status is one of {Good, Revoked, Unknown}
 	Status                                        int
 	SerialNumber                                  *big.Int
@@ -415,8 +419,10 @@ func (p ParseError) Error() string {
 }
 
 // ParseRequest parses an OCSP request in DER form. It only supports
-// requests for a single certificate. Signed requests are not supported.
-// If a request includes a signature, it will result in a ParseError.
+// requests for a single certificate identifier. If a request includes
+// multiple certificate identifiers, only the first will be included in
+// the parsed Request. Signed requests are not supported. If a request
+// includes a signature, it will result in a ParseError.
 func ParseRequest(bytes []byte) (*Request, error) {
 	var req ocspRequest
 	rest, err := asn1.Unmarshal(bytes, &req)
@@ -425,6 +431,10 @@ func ParseRequest(bytes []byte) (*Request, error) {
 	}
 	if len(rest) > 0 {
 		return nil, ParseError("trailing data in OCSP request")
+	}
+
+	if len(req.OptionalSignature.FullBytes) > 0 {
+		return nil, ParseError("signed OCSP requests are not supported")
 	}
 
 	if len(req.TBSRequest.RequestList) == 0 {
@@ -445,10 +455,18 @@ func ParseRequest(bytes []byte) (*Request, error) {
 	}, nil
 }
 
-// ParseResponse parses an OCSP response in DER form. It only supports
-// responses for a single certificate. If the response contains a certificate
-// then the signature over the response is checked. If issuer is not nil then
-// it will be used to validate the signature or embedded certificate.
+// ParseResponse parses an OCSP response in DER form. The response must contain
+// only one certificate status. To parse the status of a specific certificate
+// from a response which may contain multiple statuses, use ParseResponseForCert
+// instead.
+//
+// If the response contains an embedded certificate, then that certificate will
+// be used to verify the response signature. If the response contains an
+// embedded certificate and issuer is not nil, then issuer will be used to verify
+// the signature on the embedded certificate.
+//
+// If the response does not contain an embedded certificate and issuer is not
+// nil, then issuer will be used to verify the response signature.
 //
 // Invalid responses and parse failures will result in a ParseError.
 // Error responses will result in a ResponseError.
@@ -456,14 +474,11 @@ func ParseResponse(bytes []byte, issuer *x509.Certificate) (*Response, error) {
 	return ParseResponseForCert(bytes, nil, issuer)
 }
 
-// ParseResponseForCert parses an OCSP response in DER form and searches for a
-// Response relating to cert. If such a Response is found and the OCSP response
-// contains a certificate then the signature over the response is checked. If
-// issuer is not nil then it will be used to validate the signature or embedded
-// certificate.
-//
-// Invalid responses and parse failures will result in a ParseError.
-// Error responses will result in a ResponseError.
+// ParseResponseForCert acts identically to ParseResponse, except it supports
+// parsing responses that contain multiple statuses. If the response contains
+// multiple statuses and cert is not nil, then ParseResponseForCert will return
+// the first status which contains a matching serial, otherwise it will return an
+// error. If cert is nil, then the first status in the response will be returned.
 func ParseResponseForCert(bytes []byte, cert, issuer *x509.Certificate) (*Response, error) {
 	var resp responseASN1
 	rest, err := asn1.Unmarshal(bytes, &resp)
@@ -487,9 +502,8 @@ func ParseResponseForCert(bytes []byte, cert, issuer *x509.Certificate) (*Respon
 	if err != nil {
 		return nil, err
 	}
-
-	if len(basicResp.Certificates) > 1 {
-		return nil, ParseError("OCSP response contains bad number of certificates")
+	if len(rest) > 0 {
+		return nil, ParseError("trailing data in OCSP response")
 	}
 
 	if n := len(basicResp.TBSResponseData.Responses); n == 0 || cert == nil && n > 1 {
@@ -514,6 +528,7 @@ func ParseResponseForCert(bytes []byte, cert, issuer *x509.Certificate) (*Respon
 	}
 
 	ret := &Response{
+		Raw:                bytes,
 		TBSResponseData:    basicResp.TBSResponseData.Raw,
 		Signature:          basicResp.Signature.RightAlign(),
 		SignatureAlgorithm: getSignatureAlgorithmFromOID(basicResp.SignatureAlgorithm.Algorithm),
@@ -544,6 +559,13 @@ func ParseResponseForCert(bytes []byte, cert, issuer *x509.Certificate) (*Respon
 	}
 
 	if len(basicResp.Certificates) > 0 {
+		// Responders should only send a single certificate (if they
+		// send any) that connects the responder's certificate to the
+		// original issuer. We accept responses with multiple
+		// certificates due to a number responders sending them[1], but
+		// ignore all but the first.
+		//
+		// [1] https://github.com/golang/go/issues/21527
 		ret.Certificate, err = x509.ParseCertificate(basicResp.Certificates[0].FullBytes)
 		if err != nil {
 			return nil, err
@@ -657,7 +679,7 @@ func CreateRequest(cert, issuer *x509.Certificate, opts *RequestOptions) ([]byte
 // The responder cert is used to populate the responder's name field, and the
 // certificate itself is provided alongside the OCSP response signature.
 //
-// The issuer cert is used to puplate the IssuerNameHash and IssuerKeyHash fields.
+// The issuer cert is used to populate the IssuerNameHash and IssuerKeyHash fields.
 //
 // The template is used to populate the SerialNumber, Status, RevokedAt,
 // RevocationReason, ThisUpdate, and NextUpdate fields.

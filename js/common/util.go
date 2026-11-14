@@ -1,48 +1,75 @@
-/*
- *
- * k6 - a next-generation load testing tool
- * Copyright (C) 2016 Load Impact
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of the
- * License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- */
-
+// Package common contains helpers for interacting with the JavaScript runtime.
 package common
 
 import (
-	"github.com/dop251/goja"
-	"github.com/loadimpact/k6/js/compiler"
+	"bytes"
+	"fmt"
+	"io"
+
+	"github.com/grafana/sobek"
 )
 
-// Runs an ES6 string in the given runtime. Use this rather than writing ES5 in tests.
-func RunString(rt *goja.Runtime, src string) (goja.Value, error) {
-	compiler, err := compiler.New()
-	if err != nil {
-		panic(err)
-	}
-
-	src, _, err = compiler.Transform(src, "__string__")
-	if err != nil {
-		return goja.Undefined(), err
-	}
-	return rt.RunString(src)
-}
-
-// Throws a JS error; avoids re-wrapping GoErrors.
-func Throw(rt *goja.Runtime, err error) {
-	if e, ok := err.(*goja.Exception); ok {
+// Throw a JS error; avoids re-wrapping GoErrors.
+func Throw(rt *sobek.Runtime, err error) {
+	if e, ok := err.(*sobek.Exception); ok { //nolint:errorlint // we don't really want to unwrap here
 		panic(e)
 	}
-	panic(rt.NewGoError(err))
+	panic(rt.NewGoError(err)) // this catches the stack unlike rt.ToValue
+}
+
+// GetReader tries to return an io.Reader value from an exported Sobek value.
+func GetReader(data any) (io.Reader, error) {
+	switch r := data.(type) {
+	case string:
+		return bytes.NewBufferString(r), nil
+	case []byte:
+		return bytes.NewBuffer(r), nil
+	case io.Reader:
+		return r, nil
+	case sobek.ArrayBuffer:
+		return bytes.NewBuffer(r.Bytes()), nil
+	default:
+		return nil, fmt.Errorf("invalid type %T, it needs to be a string or ArrayBuffer", data)
+	}
+}
+
+// ToBytes tries to return a byte slice from compatible types.
+func ToBytes(data any) ([]byte, error) {
+	switch dt := data.(type) {
+	case []byte:
+		return dt, nil
+	case string:
+		return []byte(dt), nil
+	case sobek.ArrayBuffer:
+		return dt.Bytes(), nil
+	default:
+		return nil, fmt.Errorf("invalid type %T, expected string, []byte or ArrayBuffer", data)
+	}
+}
+
+// ToString tries to return a string from compatible types.
+func ToString(data any) (string, error) {
+	switch dt := data.(type) {
+	case []byte:
+		return string(dt), nil
+	case string:
+		return dt, nil
+	case sobek.ArrayBuffer:
+		return string(dt.Bytes()), nil
+	default:
+		return "", fmt.Errorf("invalid type %T, expected string, []byte or ArrayBuffer", data)
+	}
+}
+
+// IsNullish checks if the given value is nullish, i.e. nil, undefined or null.
+func IsNullish(v sobek.Value) bool {
+	return v == nil || sobek.IsUndefined(v) || sobek.IsNull(v)
+}
+
+// IsAsyncFunction checks if the provided value is an AsyncFunction
+func IsAsyncFunction(rt *sobek.Runtime, val sobek.Value) bool {
+	if IsNullish(val) {
+		return false
+	}
+	return val.ToObject(rt).Get("constructor").ToObject(rt).Get("name").String() == "AsyncFunction"
 }

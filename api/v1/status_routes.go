@@ -1,78 +1,68 @@
-/*
- *
- * k6 - a next-generation load testing tool
- * Copyright (C) 2016 Load Impact
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of the
- * License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- */
-
 package v1
 
 import (
-	"io/ioutil"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 
-	"github.com/julienschmidt/httprouter"
-	"github.com/loadimpact/k6/api/common"
-	"github.com/manyminds/api2go/jsonapi"
+	"go.k6.io/k6/v2/errext"
+	"go.k6.io/k6/v2/errext/exitcodes"
+	"go.k6.io/k6/v2/internal/execution"
 )
 
-func HandleGetStatus(rw http.ResponseWriter, r *http.Request, p httprouter.Params) {
-	engine := common.GetEngine(r.Context())
-
-	status := NewStatus(engine)
-	data, err := jsonapi.Marshal(status)
+func handleGetStatus(cs *ControlSurface, rw http.ResponseWriter, _ *http.Request) {
+	status := newStatusJSONAPIFromEngine(cs)
+	data, err := json.Marshal(status)
 	if err != nil {
 		apiError(rw, "Encoding error", err.Error(), http.StatusInternalServerError)
 		return
 	}
+	rw.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_, _ = rw.Write(data)
 }
 
-func HandlePatchStatus(rw http.ResponseWriter, r *http.Request, p httprouter.Params) {
-	engine := common.GetEngine(r.Context())
+func handlePatchStatus(cs *ControlSurface, rw http.ResponseWriter, r *http.Request) {
+	rw.Header().Set("Content-Type", "application/json; charset=utf-8")
 
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		apiError(rw, "Couldn't read request", err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	var status Status
-	if err := jsonapi.Unmarshal(body, &status); err != nil {
+	var statusEnvelop StatusJSONAPI
+	if err = json.Unmarshal(body, &statusEnvelop); err != nil {
 		apiError(rw, "Invalid data", err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	if status.VUsMax.Valid {
-		if err := engine.Executor.SetVUsMax(status.VUsMax.Int64); err != nil {
-			apiError(rw, "Couldn't change cap", err.Error(), http.StatusBadRequest)
+	status := statusEnvelop.Status()
+
+	if status.Stopped { //nolint:nestif
+		execution.AbortTestRun(
+			cs.RunCtx,
+			errext.WithAbortReasonIfNone(
+				errext.WithExitCodeIfNone(fmt.Errorf("test run stopped from REST API"), exitcodes.ScriptStoppedFromRESTAPI),
+				errext.AbortedByUser,
+			),
+		)
+	} else {
+		if status.Paused.Valid {
+			if err = cs.Scheduler.SetPaused(status.Paused.Bool); err != nil {
+				apiError(rw, "Pause error", err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+
+		if status.VUsMax.Valid || status.VUs.Valid {
+			apiError(rw, "Execution config error",
+				"live VU configuration updates are not supported", http.StatusInternalServerError)
 			return
 		}
-	}
-	if status.VUs.Valid {
-		if err := engine.Executor.SetVUs(status.VUs.Int64); err != nil {
-			apiError(rw, "Couldn't scale", err.Error(), http.StatusBadRequest)
-			return
-		}
-	}
-	if status.Paused.Valid {
-		engine.Executor.SetPaused(status.Paused.Bool)
 	}
 
-	data, err := jsonapi.Marshal(NewStatus(engine))
+	data, err := json.Marshal(newStatusJSONAPIFromEngine(cs))
 	if err != nil {
 		apiError(rw, "Encoding error", err.Error(), http.StatusInternalServerError)
 		return

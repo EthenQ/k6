@@ -1,160 +1,92 @@
-/*
- *
- * k6 - a next-generation load testing tool
- * Copyright (C) 2016 Load Impact
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of the
- * License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- */
-
 package lib
 
 import (
 	"context"
+	"io"
 
-	"github.com/loadimpact/k6/stats"
+	"go.k6.io/k6/v2/internal/lib/summary"
+	"go.k6.io/k6/v2/metrics"
 )
 
-// Ensure MiniRunner conforms to Runner.
-var _ Runner = &MiniRunner{}
+// ActiveVU represents an actively running virtual user.
+type ActiveVU interface {
+	// RunOnce runs the configured exported function in the VU once.
+	// The only way to interrupt the execution is to cancel the context given
+	// to InitializedVU.Activate()
+	RunOnce() error
+}
 
-// A Runner is a factory for VUs. It should precompute as much as possible upon creation (parse
-// ASTs, load files into memory, etc.), so that spawning VUs becomes as fast as possible.
-// The Runner doesn't actually *do* anything in itself, the Executor is responsible for wrapping
-// and scheduling these VUs for execution.
+// InitializedVU represents a virtual user ready for work. It needs to be
+// activated (i.e. given a context) before it can actually be used. Activation
+// also requires a callback function, which will be called when the supplied
+// context is done. That way, VUs can be returned to a pool and reused.
+type InitializedVU interface {
+	// Activate fully activate the VU so it will be able to run code.
+	Activate(*VUActivationParams) ActiveVU
+
+	// GetID returns the unique VU ID.
+	GetID() uint64
+}
+
+// VUActivationParams are supplied by each executor when it retrieves a VU from
+// the buffer pool and activates it for use.
+type VUActivationParams struct {
+	RunContext               context.Context
+	DeactivateCallback       func(InitializedVU)
+	Env, Tags                map[string]string
+	Exec, Scenario           string
+	GetNextIterationCounters func() (uint64, uint64)
+}
+
+// A Runner is a factory for VUs. It should precompute as much as possible upon
+// creation (parse ASTs, load files into memory, etc.), so that spawning VUs
+// becomes as fast as possible. The Runner doesn't actually *do* anything in
+// itself, the ExecutionScheduler is responsible for wrapping and scheduling
+// these VUs for execution.
 //
-// TODO: Rename this to something more obvious? This name made sense a very long time ago.
+// TODO: Rename this to something more obvious? This name made sense a very long
+// time ago.
+//
+// interfacebloat: We may evaluate in the future to move out some methods;
+// but considering how central it is, it would require a huge effort.
 type Runner interface {
-	// Creates an Archive of the runner. There should be a corresponding NewFromArchive() function
+	// MakeArchive creates an Archive of the runner. There should be a corresponding NewFromArchive() function
 	// that will restore the runner from the archive.
 	MakeArchive() *Archive
 
-	// Spawns a new VU. It's fine to make this function rather heavy, if it means a performance
+	// NewVU spawns a new VU. It's fine to make this function rather heavy, if it means a performance
 	// improvement at runtime. Remember, this is called once per VU and normally only at the start
 	// of a test - RunOnce() may be called hundreds of thousands of times, and must be fast.
-	NewVU() (VU, error)
+	NewVU(ctx context.Context, idLocal, idGlobal uint64, out chan<- metrics.SampleContainer) (InitializedVU, error)
 
-	// Runs pre-test setup, if applicable.
-	Setup(ctx context.Context) error
+	// Setup runs pre-test setup, if applicable.
+	Setup(ctx context.Context, out chan<- metrics.SampleContainer) error
 
-	// Returns the setup data if setup() is specified and run, nil otherwise
-	GetSetupData() interface{}
+	// GetSetupData returns json representation of the setup data if setup() is specified and run, nil otherwise
+	GetSetupData() []byte
 
-	// Saves the externally supplied setup data in the runner
-	SetSetupData(interface{})
+	// SetSetupData saves the externally supplied setup data as json in the runner
+	SetSetupData([]byte)
 
-	// Runs post-test teardown, if applicable.
-	Teardown(ctx context.Context) error
-
-	// Returns the default (root) Group.
-	GetDefaultGroup() *Group
+	// Teardown runs post-test teardown, if applicable.
+	Teardown(ctx context.Context, out chan<- metrics.SampleContainer) error
 
 	// Get and set options. The initial value will be whatever the script specifies (for JS,
 	// `export let options = {}`); cmd/run.go will mix this in with CLI-, config- and env-provided
 	// values and write it back to the runner.
 	GetOptions() Options
-	SetOptions(opts Options)
+	SetOptions(opts Options) error
+
+	// IsExecutable returns whether the given name is an exported and executable
+	// function in the script.
+	IsExecutable(string) bool
+
+	HandleSummary(context.Context, *LegacySummary, *summary.Summary, summary.Meta) (map[string]io.Reader, error)
 }
 
-// A VU is a Virtual User, that can be scheduled by an Executor.
-type VU interface {
-	// Runs the VU once. The VU is responsible for handling the Halting Problem, eg. making sure
-	// that execution actually stops when the context is cancelled.
-	RunOnce(ctx context.Context) ([]stats.SampleContainer, error)
-
-	// Assign the VU a new ID. Called by the Executor upon creation, but may be called multiple
-	// times if the VU is recycled because the test was scaled down and then back up.
-	Reconfigure(id int64) error
-}
-
-// MiniRunner wraps a function in a runner whose VUs will simply call that function.
-type MiniRunner struct {
-	Fn         func(ctx context.Context) ([]stats.SampleContainer, error)
-	SetupFn    func(ctx context.Context) (interface{}, error)
-	TeardownFn func(ctx context.Context) error
-
-	setupData interface{}
-
-	Group   *Group
-	Options Options
-}
-
-func (r MiniRunner) VU() *MiniRunnerVU {
-	return &MiniRunnerVU{R: r}
-}
-
-func (r MiniRunner) MakeArchive() *Archive {
-	return nil
-}
-
-func (r MiniRunner) NewVU() (VU, error) {
-	return r.VU(), nil
-}
-
-func (r *MiniRunner) Setup(ctx context.Context) (err error) {
-	if fn := r.SetupFn; fn != nil {
-		r.setupData, err = fn(ctx)
-	}
-	return
-}
-
-// GetSetupData returns the setup data if Setup() was executed, nil otherwise
-func (r MiniRunner) GetSetupData() interface{} {
-	return r.setupData
-}
-
-// SetSetupData saves the externally supplied setup data in the runner
-func (r *MiniRunner) SetSetupData(data interface{}) {
-	r.setupData = data
-}
-
-func (r MiniRunner) Teardown(ctx context.Context) error {
-	if fn := r.TeardownFn; fn != nil {
-		return fn(ctx)
-	}
-	return nil
-}
-
-func (r MiniRunner) GetDefaultGroup() *Group {
-	if r.Group == nil {
-		r.Group = &Group{}
-	}
-	return r.Group
-}
-
-func (r MiniRunner) GetOptions() Options {
-	return r.Options
-}
-
-func (r *MiniRunner) SetOptions(opts Options) {
-	r.Options = opts
-}
-
-// A VU spawned by a MiniRunner.
-type MiniRunnerVU struct {
-	R  MiniRunner
-	ID int64
-}
-
-func (vu MiniRunnerVU) RunOnce(ctx context.Context) ([]stats.SampleContainer, error) {
-	if vu.R.Fn == nil {
-		return []stats.SampleContainer{}, nil
-	}
-	return vu.R.Fn(ctx)
-}
-
-func (vu *MiniRunnerVU) Reconfigure(id int64) error {
-	vu.ID = id
-	return nil
+// UIState describes the state of the UI, which might influence what
+// handleSummary() returns.
+type UIState struct {
+	IsStdOutTTY bool
+	IsStdErrTTY bool
 }

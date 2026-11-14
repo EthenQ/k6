@@ -1,23 +1,3 @@
-/*
- *
- * k6 - a next-generation load testing tool
- * Copyright (C) 2016 Load Impact
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of the
- * License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- */
-
 package v1
 
 import (
@@ -25,15 +5,18 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/loadimpact/k6/stats"
 	"gopkg.in/guregu/null.v3"
+
+	"go.k6.io/k6/v2/metrics"
 )
 
+// NullMetricType a nullable metric struct
 type NullMetricType struct {
-	Type  stats.MetricType
+	Type  metrics.MetricType
 	Valid bool
 }
 
+// MarshalJSON implements the json.Marshaler interface.
 func (t NullMetricType) MarshalJSON() ([]byte, error) {
 	if !t.Valid {
 		return []byte("null"), nil
@@ -41,6 +24,7 @@ func (t NullMetricType) MarshalJSON() ([]byte, error) {
 	return t.Type.MarshalJSON()
 }
 
+// UnmarshalJSON implements the json.Unmarshaler interface.
 func (t *NullMetricType) UnmarshalJSON(data []byte) error {
 	if bytes.Equal(data, []byte("null")) {
 		t.Valid = false
@@ -50,11 +34,13 @@ func (t *NullMetricType) UnmarshalJSON(data []byte) error {
 	return json.Unmarshal(data, &t.Type)
 }
 
+// NullValueType a nullable metric value struct
 type NullValueType struct {
-	Type  stats.ValueType
+	Type  metrics.ValueType
 	Valid bool
 }
 
+// MarshalJSON implements the json.Marshaler interface.
 func (t NullValueType) MarshalJSON() ([]byte, error) {
 	if !t.Valid {
 		return []byte("null"), nil
@@ -62,6 +48,7 @@ func (t NullValueType) MarshalJSON() ([]byte, error) {
 	return t.Type.MarshalJSON()
 }
 
+// UnmarshalJSON implements the json.Unmarshaler interface.
 func (t *NullValueType) UnmarshalJSON(data []byte) error {
 	if bytes.Equal(data, []byte("null")) {
 		t.Valid = false
@@ -71,6 +58,7 @@ func (t *NullValueType) UnmarshalJSON(data []byte) error {
 	return json.Unmarshal(data, &t.Type)
 }
 
+// Metric represents a metric that is being collected by k6.
 type Metric struct {
 	Name string `json:"-" yaml:"name"`
 
@@ -81,7 +69,9 @@ type Metric struct {
 	Sample map[string]float64 `json:"sample" yaml:"sample"`
 }
 
-func NewMetric(m *stats.Metric, t time.Duration) Metric {
+// NewMetric constructs a new v1.Metric struct that is used for
+// a metric representation in a k6 REST API
+func NewMetric(m *metrics.Metric, t time.Duration) Metric {
 	return Metric{
 		Name:     m.Name,
 		Type:     NullMetricType{m.Type, true},
@@ -89,13 +79,4 @@ func NewMetric(m *stats.Metric, t time.Duration) Metric {
 		Tainted:  m.Tainted,
 		Sample:   m.Sink.Format(t),
 	}
-}
-
-func (m Metric) GetID() string {
-	return m.Name
-}
-
-func (m *Metric) SetID(id string) error {
-	m.Name = id
-	return nil
 }

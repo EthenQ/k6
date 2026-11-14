@@ -1,58 +1,39 @@
-/*
- *
- * k6 - a next-generation load testing tool
- * Copyright (C) 2016 Load Impact
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as
- * published by the Free Software Foundation, either version 3 of the
- * License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- */
-
 package http
 
 import (
-	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/cookiejar"
 	neturl "net/url"
 	"strings"
 	"time"
 
-	"github.com/dop251/goja"
-	"github.com/loadimpact/k6/js/common"
-	"github.com/pkg/errors"
+	"github.com/grafana/sobek"
+
+	"go.k6.io/k6/v2/js/common"
 )
 
-type HTTPCookieJar struct {
-	jar *cookiejar.Jar
-	ctx *context.Context
+// ErrJarForbiddenInInitContext is used when a cookie jar was made in the init context
+// TODO: unexport this? there's no reason for this to be exported
+var ErrJarForbiddenInInitContext = common.NewInitContextError("Making cookie jars in the init context is not supported")
+
+// CookieJar is cookiejar.Jar wrapper to be used in js scripts
+type CookieJar struct {
+	moduleInstance *ModuleInstance
+	// js is to make it not be accessible from inside Sobek/js, the json is
+	// for when it is returned from setup().
+	Jar *cookiejar.Jar `js:"-" json:"-"`
 }
 
-func newCookieJar(ctxPtr *context.Context) *HTTPCookieJar {
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		common.Throw(common.GetRuntime(*ctxPtr), err)
-	}
-	return &HTTPCookieJar{jar, ctxPtr}
-}
-
-func (j HTTPCookieJar) CookiesForURL(url string) map[string][]string {
+// CookiesForURL return the cookies for a given url as a map of key and values
+func (j CookieJar) CookiesForURL(url string) map[string][]string {
 	u, err := neturl.Parse(url)
 	if err != nil {
 		panic(err)
 	}
 
-	cookies := j.jar.Cookies(u)
+	cookies := j.Jar.Cookies(u)
 	objs := make(map[string][]string, len(cookies))
 	for _, c := range cookies {
 		objs[c.Name] = append(objs[c.Name], c.Value)
@@ -60,24 +41,21 @@ func (j HTTPCookieJar) CookiesForURL(url string) map[string][]string {
 	return objs
 }
 
-func (j HTTPCookieJar) Set(url, name, value string, opts goja.Value) (bool, error) {
-	rt := common.GetRuntime(*j.ctx)
+// Set sets a cookie for a particular url with the given name value and additional opts
+func (j CookieJar) Set(url, name, value string, opts sobek.Value) (bool, error) {
+	rt := j.moduleInstance.vu.Runtime()
 
 	u, err := neturl.Parse(url)
 	if err != nil {
 		return false, err
 	}
 
-	c := http.Cookie{Name: name, Value: value}
+	c := http.Cookie{Name: name, Value: value} //nolint:gosec // outgoing request cookie, not a Set-Cookie response
 	paramsV := opts
-	if paramsV != nil && !goja.IsUndefined(paramsV) && !goja.IsNull(paramsV) {
+	if !common.IsNullish(paramsV) {
 		params := paramsV.ToObject(rt)
 		for _, k := range params.Keys() {
 			switch strings.ToLower(k) {
-			case "name":
-				c.Name = params.Get(k).String()
-			case "value":
-				c.Value = params.Get(k).String()
 			case "path":
 				c.Path = params.Get(k).String()
 			case "domain":
@@ -88,7 +66,7 @@ func (j HTTPCookieJar) Set(url, name, value string, opts goja.Value) (bool, erro
 				if expires != "" {
 					t, err = time.Parse(time.RFC1123, expires)
 					if err != nil {
-						return false, errors.Errorf("unable to parse \"expires\" date string \"%s\" with: %s", expires, err.Error())
+						return false, fmt.Errorf(`unable to parse "expires" date string "%s": %w`, expires, err)
 					}
 				}
 				c.Expires = t
@@ -101,6 +79,39 @@ func (j HTTPCookieJar) Set(url, name, value string, opts goja.Value) (bool, erro
 			}
 		}
 	}
-	j.jar.SetCookies(u, []*http.Cookie{&c})
+	j.Jar.SetCookies(u, []*http.Cookie{&c})
 	return true, nil
+}
+
+// Clear all cookies for a particular URL
+func (j CookieJar) Clear(url string) error {
+	u, err := neturl.Parse(url)
+	if err != nil {
+		return err
+	}
+
+	cookies := j.Jar.Cookies(u)
+	for _, c := range cookies {
+		c.MaxAge = -1
+	}
+	j.Jar.SetCookies(u, cookies)
+
+	return nil
+}
+
+// Delete cookies for a particular URL
+func (j CookieJar) Delete(url, name string) error {
+	if name == "" {
+		return errors.New("cookie: is null")
+	}
+
+	u, err := neturl.Parse(url)
+	if err != nil {
+		return err
+	}
+
+	c := http.Cookie{Name: name, MaxAge: -1} //nolint:gosec // outgoing request cookie, not a Set-Cookie response
+	j.Jar.SetCookies(u, []*http.Cookie{&c})
+
+	return nil
 }

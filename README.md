@@ -1,151 +1,128 @@
-<p align="center"><img src="logo.png" alt="k6" width="300" height="282"></p>
+<p align="center">
+  <a href="https://grafana.com/oss/k6/">
+    <picture>
+      <img src="assets/logo.svg" alt="Grafana k6" width="210" height="210" /><br>
+    </picture>
+    <br>
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="assets/grafana-labs-dark-theme.svg">
+      <source media="(prefers-color-scheme: light)" srcset="assets/grafana-labs.svg">
+      <img src="assets/grafana-labs.svg" alt="Grafana Labs" width="210" />
+    </picture>
+    <br>
+  </a>
+</p>
 
 <h3 align="center">Like unit testing, for performance</h3>
-<p align="center">A modern load testing tool for developers and testers in the DevOps era.</p>
+<p align="center">Modern load testing for developers and testers in the DevOps era.</p>
 
 <p align="center">
-  <a href="https://github.com/loadimpact/k6/releases"><img src="https://img.shields.io/github/release/loadimpact/k6.svg" alt="Github release"></a>
-  <a href="https://circleci.com/gh/loadimpact/k6/tree/master"><img src="https://img.shields.io/circleci/project/github/loadimpact/k6/master.svg" alt="Build status"></a>
-  <a href="https://goreportcard.com/report/github.com/loadimpact/k6"><img src="https://goreportcard.com/badge/github.com/loadimpact/k6" alt="Go Report Card"></a>
-  <a href="https://codecov.io/gh/loadimpact/k6"><img src="https://img.shields.io/codecov/c/github/loadimpact/k6/master.svg" alt="Codecov branch"></a>
+  <a href="https://github.com/grafana/k6/releases"><img src="https://img.shields.io/github/release/grafana/k6.svg" alt="Github release"></a>
+  <a href="https://github.com/grafana/k6/actions/workflows/all.yml"><img src="https://github.com/grafana/k6/actions/workflows/build.yml/badge.svg" alt="Build status"></a>
+  <a href="https://goreportcard.com/report/github.com/grafana/k6"><img src="https://goreportcard.com/badge/github.com/grafana/k6" alt="Go Report Card"></a>
+ <a href="https://codecov.io/gh/grafana/k6"><img src="https://img.shields.io/codecov/c/github/grafana/k6/master.svg" alt="Codecov branch"></a>
   <br>
   <a href="https://twitter.com/k6_io"><img src="https://img.shields.io/badge/twitter-@k6_io-55acee.svg" alt="@k6_io on Twitter"></a>
-  <a href="https://k6.io/slack"><img src="https://img.shields.io/badge/Slack-k6-ff69b4.svg" alt="Slack channel"></a>
 </p>
 <p align="center">
-	<a href="https://github.com/loadimpact/k6/releases">Download</a> ·
-	<a href="https://docs.k6.io">Documentation</a> ·
-	<a href="https://k6.io/slack">Community</a>
+    <a href="https://github.com/grafana/k6/releases">Download</a> ·
+    <a href="https://grafana.com/docs/k6/latest/">Documentation</a> ·
+    <a href="https://community.grafana.com/c/grafana-k6/70">Community Forum</a> ·
+    <a href="https://github.com/orgs/grafana/projects/443/views/1">Public Roadmap</a>
 </p>
 
----
+<br/>
+<img src="assets/github-hr.png" alt="---" />
+<br/>
 
-**k6** is a modern load testing tool, building on [Load Impact](https://loadimpact.com/)'s years of experience in the load and performance testing industry. It provides a clean, approachable scripting API, local and cloud execution, with command & control through CLI or a REST API.
+**k6** is a modern load-testing tool, built on [our years of experience](https://k6.io/about) in the performance and testing industries.
+It's built to be powerful, extensible, and full-featured. The key design goal is to provide **the best developer experience**.
 
-This is how load testing should look in the 21st century.
+Its core features are:
 
-<p align="center">
-  <img width="600" src="https://cdn.rawgit.com/loadimpact/k6/master/demo.svg">
-</p>
+- **Configurable load generation.** Even lower-end machines can simulate lots of traffic.
+- **Tests as code.** Reuse scripts, modularize logic, version control, and integrate tests with your CI.
+- **A full-featured API.** The scripting API is packed with features that help you simulate real application traffic.
+- **An embedded JavaScript engine.** The performance of Go, the scripting familiarity of JavaScript.
+- **Multiple Protocol support**. HTTP, WebSockets, gRPC, Browser, and more.
+- **Large extension ecosystem.** You can extend k6 to support your needs. And many people have already shared their extensions with the community! [Explore](https://grafana.com/docs/k6/latest/extensions/explore) the available extensions.
+- **Flexible metrics storage and visualization**. Summary statistics or granular metrics, exported to the service of your choice.
+- **Native integration with Grafana cloud**. [SaaS solution](https://grafana.com/products/cloud/k6/) for test execution, metrics correlation, data analysis, and more.
 
-Menu
-----
+This is what load testing looks like in the 21st century.
 
-- [Features](#features)
-- [Install](#install)
-- [Quick Start](#quick-start)
-- [Need help or want to contribute?](#need-help-or-want-to-contribute)
+## Example script
 
-Features
---------
-
-- **Scripting in ES6 JS**: support for [modules](https://docs.k6.io/docs/modules) to aid code reusability across an organization
-- **Everything as code**: test logic and [configuration options](https://docs.k6.io/docs/options) are both in JS for version control friendliness
-- **Automation-friendly**: [checks](https://docs.k6.io/docs/checks) (like asserts) and [thresholds](https://docs.k6.io/docs/thresholds)
-- **HTTP/1.1**, [**HTTP/2**](https://docs.k6.io/docs/http2) and [**WebSocket**](https://docs.k6.io/docs/websockets) protocol support
-- **TLS features**: [client certificates](https://docs.k6.io/docs/ssl-tls-client-certificates), [configurable SSL/TLS versions and ciphers](https://docs.k6.io/docs/ssl-tls-version-and-cipher-suites)
-- **Batteries included**: [Cookies](https://docs.k6.io/docs/cookies), [Crypto](https://docs.k6.io/docs/k6crypto), [Custom metrics](https://docs.k6.io/docs/result-metrics#section-custom-metrics), [Encodings](https://docs.k6.io/docs/k6encoding), [Environment variables](https://docs.k6.io/docs/environment-variables), JSON, [HTML forms](https://docs.k6.io/docs/working-with-html-forms) and more.
-- **Flexible metrics storage/visualization**: [InfluxDB](https://docs.k6.io/docs/influxdb-grafana) (+Grafana), JSON or [Load Impact Insights](https://docs.k6.io/docs/load-impact-insights)
-
-There's even more! [See all features available in k6.](https://docs.k6.io/docs/welcome)
-
-Install
-------
-
-### Mac
-
-```bash
-brew tap loadimpact/k6
-brew install k6
-```
-
-### Other Platforms
-
-Grab a prebuilt binary from [the Releases page](https://github.com/loadimpact/k6/releases).
-
-Install the binary in your _PATH_ to run k6 from any location.
-
-### Docker
-
-```bash
-docker pull loadimpact/k6
-```
-
-### Build from source
-To build from source you need **[Git](https://git-scm.com/downloads)** and **[Go](https://golang.org/doc/install)** (1.8 or newer). Follow these instructions:
-
-- Run `go get github.com/loadimpact/k6` which will:
-  - git clone the repo and put the source in `$GOPATH/src/github.com/loadimpact/k6`
-  - build a `k6` binary and put it in `$GOPATH/bin`
-- Make sure you have `$GOPATH/bin` in your PATH
-- Tada, you can now run k6 using `k6 run script.js`
-
-Quick start
------------
-
-k6 works with the concept of **virtual users** (VUs), which run scripts - they're essentially glorified, parallel `while(true)` loops. Scripts are written using JavaScript, as ES6 modules, which allows you to break larger tests into smaller and more reusable pieces, which makes it easy to scale across an organization.
-
-Scripts must contain, at the very least, a `default` function - this defines the entry point for your VUs, similar to the `main()` function in many other languages:
-
-```js
-export default function() {
-    // do things here...
-}
-```
-
-*"Why not just run my script normally, from top to bottom"*, you might ask - the answer is: we do, but code **inside** and **outside** your `default` function can do different things.
-
-Code inside `default` is called "VU code", and is run over and over for as long as the test is running. Code outside of it is called "init code", and is run only once per VU.
-
-VU code can make HTTP requests, emit metrics, and generally do everything you'd expect a load test to do - with a few important exceptions: you can't load anything from your local filesystem, or import any other modules. This all has to be done from init code.
-
-There are two reasons for this. The first is, of course: performance.
-
-If you read a file from disk on every single script iteration, it'd be needlessly slow; even if you cache the contents of the file and any imported modules, it'd mean the *first run* of the script would be much slower than all the others. Worse yet, if you have a script that imports or loads things based on things that can only be known at runtime, you'd get slow iterations thrown in every time you load something new.
-
-But there's another, more interesting reason. By forcing all imports and file reads into the init context, we design for distributed execution. We know which files will be needed, so we distribute only those files. We know which modules will be imported, so we can bundle them up from the get-go. And, tying into the performance point above, the other nodes don't even need writable filesystems - everything can be kept in-memory.
-
-As an added bonus, you can use this to reuse data between iterations (but only for the same VU):
-
-```js
-var counter = 0;
-
-export default function() {
-    counter++;
-}
-```
-
-### Running k6
-
-First, create a k6 script to describe what the virtual users should do in your load test:
 
 ```js
 import http from "k6/http";
+import { check, sleep } from "k6";
 
-export default function() {
-  http.get("http://test.loadimpact.com");
+// Test configuration
+export const options = {
+  thresholds: {
+    // Assert that 99% of requests finish within 3000ms.
+    http_req_duration: ["p(99) < 3000"],
+  },
+  // Ramp the number of virtual users up and down
+  stages: [
+    { duration: "30s", target: 15 },
+    { duration: "1m", target: 15 },
+    { duration: "20s", target: 0 },
+  ],
 };
+
+// Simulated user behavior
+export default function () {
+  let res = http.get("https://quickpizza.grafana.com");
+  // Validate response status
+  check(res, { "status was 200": (r) => r.status == 200 });
+  sleep(1);
+}
 ```
 
-Save it as `script.js`, then run k6 like this:
+You can run scripts like this on the CLI, or in your CI, or across a Kubernetes cluster.
 
-`k6 run script.js`
+> [!NOTE]
+> Don't want to write code ?
+> 
+> We got you! Meet [k6 Studio](https://github.com/grafana/k6-studio), a desktop application made to help you generate k6 scripts without having to touch code!
 
-(Note that if you use the Docker image, the command is slightly different: `docker run -i loadimpact/k6 run - <script.js`)
+## Documentation
 
-For more information on how to get started running k6, please look at the [Running k6](https://docs.k6.io/docs/running-k6) documentation. If you want more info on the scripting API or results output, you'll find that also on [https://docs.k6.io](https://docs.k6.io).
+The docs cover all aspects of using k6. Some highlights include:
 
----
+- [Get Started](https://grafana.com/docs/k6/latest/). Install, run a test, inspect results.
+- [HTTP requests](https://grafana.com/docs/k6/latest/using-k6/http-requests/). Have your virtual users use HTTP methods.
+  Or, check the other [Protocols](https://grafana.com/docs/k6/latest/using-k6/protocols/).
+- [Thresholds](https://grafana.com/docs/k6/latest/using-k6/thresholds/). Set goals for your test, and codify your SLOs.
+- [Options](https://grafana.com/docs/k6/latest/using-k6/k6-options/). Configure your load, duration, TLS certificates, and much, much more.
+- [Scenarios](https://grafana.com/docs/k6/latest/using-k6/scenarios/).
+  Choose how to model your workload: open models, closed models, constant RPS, fixed iterations, and more.
+- [Results output](https://grafana.com/docs/k6/latest/results-output/). Study, filter, and export your test results.
+- [JavaScript API](https://grafana.com/docs/k6/latest/javascript-api/). Reference and examples of all k6 modules.
+- [Extensions](https://grafana.com/docs/k6/latest/extensions/). Extend k6 for new protocols and use cases.
 
-Need help or want to contribute?
---------------------------------
+These links barely scratch the surface! If you're looking for conceptual information, you can read about [Test types](https://grafana.com/docs/k6/latest/testing-guides/test-types/), [Test strategies](https://grafana.com/docs/k6/latest/testing-guides/), or one of the many informative [Blog posts](https://k6.io/blog).
 
-Types of questions and where to ask:
+## Roadmap
 
-- How do I? -- [Stack Overflow](https://stackoverflow.com/questions/tagged/k6) (use tags: k6, javascript, load-testing)
-- I got this error, why? -- [Stack Overflow](https://stackoverflow.com/questions/tagged/k6)
-- I got this error and I'm sure it's a bug -- [file an issue](https://github.com/loadimpact/k6/issues)
-- I have an idea/request -- [file an issue](https://github.com/loadimpact/k6/issues)
-- Why do you? -- [Slack](https://k6.io/slack)
-- When will you? -- [Slack](https://k6.io/slack)
-- I want to contribute/help with development -- Start by reading [CONTRIBUTING.md](https://github.com/loadimpact/k6/blob/master/CONTRIBUTING.md), then [Slack](https://k6.io/slack) and [issues](https://github.com/loadimpact/k6/issues)
+Our team is dedicated to continuously improving and providing the best user experience possible. The [public roadmap](https://github.com/orgs/grafana/projects/443/views/1) covers user-oriented features, UX improvements and JavaScript support that our team will focus on. Remember that timeframes and priorities may shift, but we believe it's important to share our vision.
+
+We hope it provides a clear overview of our plans for future development. We welcome feedback, corrections, and suggestions via GitHub to make it more comprehensive, accessible, and valuable for the community.
+
+It's worth mentioning that we consider [upvotes (thumbs-up)](https://github.com/grafana/k6/issues?q=is%3Aissue+is%3Aopen+sort%3Areactions-%2B1-desc) to be one of the essential metrics for determining community needs. If you want to show us the importance of a feature, please give it a thumbs-up.
+
+## Contribute
+
+If you want to contribute or help with the development of k6, start by reading [CONTRIBUTING.md](CONTRIBUTING.md). Before you start coding, it might be a good idea to first discuss your plans and implementation details with the k6 maintainers—especially when it comes to big changes and features. You can do this in the [GitHub issue](https://github.com/grafana/k6/issues) for the problem you're solving (create one if it doesn't exist).
+
+> **Note:** To disclose security issues, refer to [SECURITY.md](https://github.com/grafana/k6?tab=security-ov-file).
+
+## Support
+
+To get help, report bugs, suggest features, and discuss k6 with others, refer to [SUPPORT.md](SUPPORT.md).
+
+## License
+
+k6 is distributed under the [AGPL-3.0 license](https://github.com/grafana/k6/blob/master/LICENSE.md).

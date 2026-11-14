@@ -1,17 +1,38 @@
-FROM golang:1.9-alpine as builder
-WORKDIR $GOPATH/src/github.com/loadimpact/k6
-ADD . .
-RUN apk --no-cache add --virtual .build-deps git make build-base && \
-  go get . && CGO_ENABLED=0 go install -a -ldflags '-s -w' && \
-  go get github.com/GeertJohan/go.rice && \
-  cd $GOPATH/src/github.com/GeertJohan/go.rice/rice && \
-  go get . && go install && \
-  cd $GOPATH/src/github.com/loadimpact/k6 && \
-  rice append --exec=$GOPATH/bin/k6 -i ./js/compiler -i ./js/lib
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd as builder
+WORKDIR $GOPATH/src/go.k6.io/k6
+COPY . .
+ARG TARGETOS TARGETARCH
+RUN apk --no-cache add git=~2
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
+    -ldflags "-X go.k6.io/k6/v2/internal/build.BuildOrigin=release" -o /usr/bin/k6
 
-FROM alpine
-WORKDIR /root/
-COPY --from=builder /go/bin/k6 /root
-COPY --from=builder /etc/ssl /etc/ssl
-ENV PATH "$PATH:/root"
-ENTRYPOINT ["./k6"]
+# Runtime stage
+FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 as release
+
+RUN adduser -D -u 12345 -g 12345 k6
+COPY --from=builder /usr/bin/k6 /usr/bin/k6
+
+USER 12345
+WORKDIR /home/k6
+
+ENTRYPOINT ["k6"]
+
+# Browser-enabled bundle
+FROM release as with-browser
+
+USER root
+
+COPY --from=release /usr/bin/k6 /usr/bin/k6
+RUN apk --no-cache add chromium chromium-swiftshader
+
+USER 12345
+
+ENV CHROME_BIN=/usr/bin/chromium-browser
+ENV CHROME_PATH=/usr/lib/chromium/
+
+ENV K6_BROWSER_HEADLESS=true
+# no-sandbox chrome arg is required to run chrome browser in
+# alpine and avoids the usage of SYS_ADMIN Docker capability
+ENV K6_BROWSER_ARGS=no-sandbox
+
+ENTRYPOINT ["k6"]

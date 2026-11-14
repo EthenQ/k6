@@ -1,0 +1,464 @@
+package common
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"strings"
+	"time"
+
+	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/emulation"
+	cdppage "github.com/chromedp/cdproto/page"
+	"go.k6.io/k6/v2/internal/js/modules/k6/browser/log"
+)
+
+// ScreenshotPersister is the type that all file persisters must implement. It's job is
+// to persist a file somewhere, hiding the details of where and how from the caller.
+type ScreenshotPersister interface {
+	Persist(ctx context.Context, path string, data io.Reader) (err error)
+}
+
+// ImageFormat represents an image file format.
+type ImageFormat string
+
+// Valid image format options.
+const (
+	ImageFormatJPEG ImageFormat = "jpeg"
+	ImageFormatPNG  ImageFormat = "png"
+)
+
+func (f ImageFormat) String() string {
+	return imageFormatToString[f]
+}
+
+var imageFormatToString = map[ImageFormat]string{ //nolint:gochecknoglobals
+	ImageFormatJPEG: "jpeg",
+	ImageFormatPNG:  "png",
+}
+
+var imageFormatToID = map[string]ImageFormat{ //nolint:gochecknoglobals
+	"jpeg": ImageFormatJPEG,
+	"png":  ImageFormatPNG,
+}
+
+func ImageIDFromString(format string) (ImageFormat, bool) {
+	id, exists := imageFormatToID[format]
+	return id, exists
+}
+
+// MarshalJSON marshals the enum as a quoted JSON string.
+func (f ImageFormat) MarshalJSON() ([]byte, error) {
+	buffer := bytes.NewBufferString(`"`)
+	buffer.WriteString(imageFormatToString[f])
+	buffer.WriteString(`"`)
+	return buffer.Bytes(), nil
+}
+
+// UnmarshalJSON unmarshals a quoted JSON string to the enum value.
+func (f *ImageFormat) UnmarshalJSON(b []byte) error {
+	var j string
+	err := json.Unmarshal(b, &j)
+	if err != nil {
+		return fmt.Errorf("unmarshalling image format: %w", err)
+	}
+	// Note that if the string cannot be found then it will be set to the zero value.
+	*f = imageFormatToID[j]
+	return nil
+}
+
+type screenshotter struct {
+	ctx       context.Context
+	parentCtx context.Context
+	persister ScreenshotPersister
+	logger    *log.Logger
+}
+
+// Cleanup gets a short independent budget after the operation deadline expires.
+const screenshotCleanupTimeout = time.Second
+
+func newScreenshotter(
+	ctx context.Context,
+	timeout time.Duration,
+	sp ScreenshotPersister,
+	logger *log.Logger,
+) (*screenshotter, context.CancelFunc) {
+	parentCtx := ctx
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
+	return &screenshotter{ctx: ctx, parentCtx: parentCtx, persister: sp, logger: logger}, cancel
+}
+
+func (s *screenshotter) cleanupContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(s.parentCtx, screenshotCleanupTimeout)
+}
+
+func (s *screenshotter) fullPageSize(p *Page) (*Size, error) {
+	opts := evalOptions{
+		forceCallable: true,
+		returnByValue: true,
+	}
+	result, err := p.frameManager.MainFrame().evaluate(s.ctx, mainWorld, opts, `
+        () => {
+            if (!document.body || !document.documentElement) {
+                return null;
+            }
+            return {
+                width: Math.max(
+                    document.body.scrollWidth, document.documentElement.scrollWidth,
+                    document.body.offsetWidth, document.documentElement.offsetWidth,
+                    document.body.clientWidth, document.documentElement.clientWidth
+                ),
+                height: Math.max(
+                    document.body.scrollHeight, document.documentElement.scrollHeight,
+                    document.body.offsetHeight, document.documentElement.offsetHeight,
+                    document.body.clientHeight, document.documentElement.clientHeight
+                ),
+            };
+        }`)
+	if err != nil {
+		return nil, err
+	}
+	var size Size
+	if err := convert(result, &size); err != nil {
+		return nil, fmt.Errorf("converting result (%v of type %t) to size: %w", result, result, err)
+	}
+
+	return &size, nil
+}
+
+func (s *screenshotter) originalViewportSize(p *Page) (*Size, error) {
+	viewportSize := p.viewportSize()
+	if viewportSize.Width != 0 || viewportSize.Height != 0 {
+		return &viewportSize, nil
+	}
+
+	opts := evalOptions{
+		forceCallable: true,
+		returnByValue: true,
+	}
+	result, err := p.frameManager.MainFrame().evaluate(s.ctx, mainWorld, opts, `
+	() => (
+		{ width: window.innerWidth, height: window.innerHeight }
+	)`)
+	if err != nil {
+		return nil, fmt.Errorf("getting viewport dimensions: %w", err)
+	}
+
+	var returnVal Size
+	if err := convert(result, &returnVal); err != nil {
+		return nil, fmt.Errorf("unpacking window size: %w", err)
+	}
+
+	viewportSize.Width = returnVal.Width
+	viewportSize.Height = returnVal.Height
+
+	return &viewportSize, nil
+}
+
+func (s *screenshotter) restoreViewport(p *Page, originalSize *EmulatedSize) error {
+	ctx, cancel := s.cleanupContext()
+	defer cancel()
+	if originalSize != nil {
+		return p.setEmulatedSize(ctx, originalSize)
+	}
+	return p.resetViewport(ctx)
+}
+
+func (s *screenshotter) screenshot(
+	sess session, doc, viewport *Rect, format ImageFormat, omitBackground bool, quality int64, path string,
+) (buf []byte, err error) {
+	var clip *cdppage.Viewport
+	capture := newCommand(cdppage.CaptureScreenshot, cdppage.CaptureScreenshotParams{})
+
+	shouldSetDefaultBackground := omitBackground && format == "png"
+	if shouldSetDefaultBackground {
+		action := newCommand(emulation.SetDefaultBackgroundColorOverride,
+			emulation.SetDefaultBackgroundColorOverrideParams{Color: &cdp.RGBA{R: 0, G: 0, B: 0, A: 0}})
+		defer func() {
+			ctx, cancel := s.cleanupContext()
+			defer cancel()
+			if restoreErr := newCommand(emulation.SetDefaultBackgroundColorOverride,
+				emulation.SetDefaultBackgroundColorOverrideParams{}).Do(ctx, sess); restoreErr != nil {
+				err = errors.Join(err, fmt.Errorf("resetting screenshot background color: %w", restoreErr))
+			}
+		}()
+		if err := action.Do(s.ctx, sess); err != nil {
+			return nil, fmt.Errorf("setting screenshot background transparency: %w", err)
+		}
+	}
+
+	// Add common options
+	capture.params.Quality = new(quality)
+	switch format {
+	case ImageFormatJPEG:
+		capture.params.Format = cdppage.CaptureScreenshotFormatJpeg
+	default:
+		capture.params.Format = cdppage.CaptureScreenshotFormatPng
+	}
+
+	visualViewportScale, visualViewportPageX, visualViewportPageY, err := getViewPortDimensions(s.ctx, sess, s.logger)
+	if err != nil {
+		return nil, err
+	}
+
+	if doc == nil {
+		s := Size{
+			Width:  viewport.Width / visualViewportScale,
+			Height: viewport.Height / visualViewportScale,
+		}.enclosingIntSize()
+		doc = &Rect{
+			X:      visualViewportPageX + viewport.X,
+			Y:      visualViewportPageY + viewport.Y,
+			Width:  s.Width,
+			Height: s.Height,
+		}
+	}
+
+	scale := 1.0
+	if viewport != nil {
+		scale = visualViewportScale
+	}
+	clip = &cdppage.Viewport{
+		X:      doc.X,
+		Y:      doc.Y,
+		Width:  doc.Width,
+		Height: doc.Height,
+		Scale:  scale,
+	}
+	if clip.Width > 0 && clip.Height > 0 {
+		capture.params.Clip = clip
+	}
+	// Capture screenshot
+	result, err := capture.Result(s.ctx, sess)
+	buf = result.Data
+	if err != nil {
+		return nil, fmt.Errorf("capturing screenshot: %w", err)
+	}
+
+	// Save screenshot capture to file
+	if path != "" {
+		if err := s.persister.Persist(s.ctx, path, bytes.NewBuffer(buf)); err != nil {
+			return nil, fmt.Errorf("persisting screenshot: %w", err)
+		}
+	}
+
+	return buf, nil
+}
+
+func getViewPortDimensions(ctx context.Context, sess session, logger *log.Logger) (float64, float64, float64, error) {
+	visualViewportScale := 1.0
+	visualViewportPageX, visualViewportPageY := 0.0, 0.0
+
+	// Add clip region
+	metrics, err := newCommand(cdppage.GetLayoutMetrics, cdp.Empty{}).Result(ctx, sess)
+	cssVisualViewport := metrics.CSSVisualViewport
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("getting layout metrics for screenshot: %w", err)
+	}
+
+	// we had a null pointer panic cases, when visualViewport is nil
+	// instead of the erroring out, we fallback to defaults and still try to do a screenshot
+	if cssVisualViewport != nil {
+		visualViewportScale = cssVisualViewport.Scale
+		visualViewportPageX = cssVisualViewport.PageX
+		visualViewportPageY = cssVisualViewport.PageY
+	} else {
+		logger.Warnf(
+			"Screenshotter::screenshot",
+			"chrome browser returned nil on page.getLayoutMetrics, falling back to defaults for cssVisualViewport "+
+				"(scale: %v, pageX: %v, pageY: %v)."+
+				"This is non-standard behavior, if possible please report this issue (with a reproducible script) "+
+				"to the https://github.com/grafana/k6/issues/new.",
+			visualViewportScale, visualViewportPageX, visualViewportPageY,
+		)
+	}
+
+	return visualViewportScale, visualViewportPageX, visualViewportPageY, nil
+}
+
+func (s *screenshotter) screenshotElement(
+	h *ElementHandle, opts *ElementHandleScreenshotOptions,
+) (buf []byte, err error) {
+	format := opts.Format
+	viewportSize, err := s.originalViewportSize(h.frame.page)
+	if err != nil {
+		return nil, fmt.Errorf("getting original viewport size: %w", err)
+	}
+	originalSize := h.frame.page.emulatedSize
+
+	err = h.waitAndScrollIntoViewIfNeeded(h.ctx, false, true, opts.Timeout)
+	if err != nil {
+		return nil, fmt.Errorf("scrolling element into view: %w", err)
+	}
+
+	bbox, err := h.boundingBox()
+	if err != nil {
+		return nil, fmt.Errorf("node is either not visible or not an HTMLElement: %w", err)
+	}
+	if bbox.Width <= 0 {
+		return nil, fmt.Errorf("node has 0 width")
+	}
+	if bbox.Height <= 0 {
+		return nil, fmt.Errorf("node has 0 height")
+	}
+
+	fitsViewport := bbox.Width <= viewportSize.Width && bbox.Height <= viewportSize.Height
+	if !fitsViewport { //nolint:nestif
+		overriddenViewportSize := Size{
+			Width:  math.Max(viewportSize.Width, bbox.Width),
+			Height: math.Max(viewportSize.Height, bbox.Height),
+		}.enclosingIntSize()
+		defer func() {
+			if restoreErr := s.restoreViewport(h.frame.page, originalSize); restoreErr != nil {
+				err = errors.Join(err, fmt.Errorf("restoring viewport: %w", restoreErr))
+			}
+		}()
+		if err := h.frame.page.setViewportSize(s.ctx, overriddenViewportSize); err != nil {
+			return nil, fmt.Errorf("setting viewport size to %s: %w",
+				overriddenViewportSize, err)
+		}
+		err = h.waitAndScrollIntoViewIfNeeded(h.ctx, false, true, opts.Timeout)
+		if err != nil {
+			return nil, fmt.Errorf("scrolling element into view: %w", err)
+		}
+		bbox, err = h.boundingBox()
+		if err != nil {
+			return nil, fmt.Errorf("node is either not visible or not an HTMLElement: %w", err)
+		}
+		if bbox.Width <= 0 {
+			return nil, fmt.Errorf("node has 0 width")
+		}
+		if bbox.Height <= 0 {
+			return nil, fmt.Errorf("node has 0 height")
+		}
+	}
+
+	scrollOffset, err := h.Evaluate(`() => { return {x: window.scrollX, y: window.scrollY};}`)
+	if err != nil {
+		return nil, fmt.Errorf("evaluating scroll offset: %w", err)
+	}
+
+	var returnVal Position
+	if err := convert(scrollOffset, &returnVal); err != nil {
+		return nil, fmt.Errorf("unpacking scroll offset: %w", err)
+	}
+
+	documentRect := bbox
+	documentRect.X += returnVal.X
+	documentRect.Y += returnVal.Y
+
+	return s.screenshot(
+		h.frame.page.session,
+		documentRect.enclosingIntRect(),
+		nil, // viewportRect
+		format,
+		opts.OmitBackground,
+		opts.Quality,
+		opts.Path,
+	)
+}
+
+func (s *screenshotter) screenshotPage(p *Page, opts *PageScreenshotOptions) (buf []byte, err error) {
+	format := opts.Format
+
+	// Infer file format by path
+	if opts.Path != "" && opts.Format != "png" && opts.Format != "jpeg" {
+		if strings.HasSuffix(opts.Path, ".jpg") || strings.HasSuffix(opts.Path, ".jpeg") {
+			format = "jpeg"
+		}
+	}
+
+	viewportSize, err := s.originalViewportSize(p)
+	if err != nil {
+		return nil, fmt.Errorf("getting original viewport size: %w", err)
+	}
+	originalSize := p.emulatedSize
+
+	if opts.FullPage { //nolint:nestif
+		fullPageSize, sizeErr := s.fullPageSize(p)
+		if sizeErr != nil {
+			return nil, fmt.Errorf("getting full page size: %w", sizeErr)
+		}
+		documentRect := &Rect{
+			X:      0,
+			Y:      0,
+			Width:  fullPageSize.Width,
+			Height: fullPageSize.Height,
+		}
+		fitsViewport := fullPageSize.Width <= viewportSize.Width && fullPageSize.Height <= viewportSize.Height
+		if !fitsViewport {
+			defer func() {
+				if restoreErr := s.restoreViewport(p, originalSize); restoreErr != nil {
+					err = errors.Join(err, fmt.Errorf("restoring viewport to %s: %w",
+						viewportSize, restoreErr))
+				}
+			}()
+			if err := p.setViewportSize(s.ctx, fullPageSize); err != nil {
+				return nil, fmt.Errorf("setting viewport size to %s: %w",
+					fullPageSize, err)
+			}
+		}
+		if opts.Clip != nil {
+			documentRect, err = s.trimClipToSize(&Rect{
+				X:      opts.Clip.X,
+				Y:      opts.Clip.Y,
+				Width:  opts.Clip.Width,
+				Height: opts.Clip.Height,
+			}, &Size{Width: documentRect.Width, Height: documentRect.Height})
+			if err != nil {
+				return nil, fmt.Errorf("trimming clip to size: %w", err)
+			}
+		}
+
+		return s.screenshot(p.session, documentRect, nil, format, opts.OmitBackground, opts.Quality, opts.Path)
+	}
+
+	viewportRect := &Rect{
+		X:      0,
+		Y:      0,
+		Width:  viewportSize.Width,
+		Height: viewportSize.Height,
+	}
+	if opts.Clip != nil {
+		viewportRect, err = s.trimClipToSize(&Rect{
+			X:      opts.Clip.X,
+			Y:      opts.Clip.Y,
+			Width:  opts.Clip.Width,
+			Height: opts.Clip.Height,
+		}, viewportSize)
+		if err != nil {
+			return nil, fmt.Errorf("trimming clip to size: %w", err)
+		}
+	}
+	return s.screenshot(p.session, nil, viewportRect, format, opts.OmitBackground, opts.Quality, opts.Path)
+}
+
+func (s *screenshotter) trimClipToSize(clip *Rect, size *Size) (*Rect, error) {
+	p1 := Position{
+		X: math.Max(0, math.Min(clip.X, size.Width)),
+		Y: math.Max(0, math.Min(clip.Y, size.Height)),
+	}
+	p2 := Position{
+		X: math.Max(0, math.Min(clip.X+clip.Width, size.Width)),
+		Y: math.Max(0, math.Min(clip.Y+clip.Height, size.Height)),
+	}
+	result := Rect{
+		X:      p1.X,
+		Y:      p1.Y,
+		Width:  p2.X - p1.X,
+		Height: p2.Y - p1.Y,
+	}
+	if result.Width == 0 || result.Height == 0 {
+		return nil, errors.New("clip area is either empty or outside the viewport")
+	}
+	return &result, nil
+}
